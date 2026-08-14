@@ -268,11 +268,25 @@ export class LogUpdate {
       // mid-screen. Full repaint rebuilds the virtual↔physical mapping from
       // scratch. clearTerminal no longer emits ESC[2J/3J (scroll-up instead),
       // so this is safe: scrollback preserved, no WT viewport jump.
+      //
+      // visibleOnly: after the scroll-up clear the physical screen is blank
+      // and the cursor is at (0, 0); rows above the viewport are scrolled-away
+      // history that no later diff can reach (the steady loop skips
+      // y < viewportY). Repainting them re-emits the ENTIRE transcript —
+      // including the splash header — on every turn-end shrink (spinner
+      // removal, reasoning fold, tool-card collapse), flooding scrollback
+      // with duplicates (issue #69). Emitting exactly one viewport of rows
+      // leaves the same visible bottom rows and the same virtual end cursor
+      // (0, height) as the full repaint: every rendered row ends with CR+LF
+      // and the terminal clamps at the bottom, so K=viewport and K=height
+      // both settle showing the last viewport-1 rows + the cursor line.
       if (!altScreen && prev.screen.height > prev.viewport.height) {
         return fullResetSequence_CAUSES_FLICKER(
           next,
           'offscreen',
           this.options.stylePool,
+          undefined,
+          true,
         )
       }
 
@@ -536,19 +550,26 @@ function fullResetSequence_CAUSES_FLICKER(
   reason: FlickerReason,
   stylePool: StylePool,
   debug?: { triggerY: number; prevLine: string; nextLine: string },
+  /**
+   * Main-screen shrink reset only: repaint just the bottom viewport of rows
+   * instead of the whole frame. Rows above are unreachable scrollback —
+   * reprinting them duplicates scrolled-away history (and the splash
+   * header) into scrollback on every shrink. See the call site in
+   * LogUpdate.render for the equivalence argument.
+   */
+  visibleOnly?: boolean,
 ): Diff {
-  // After clearTerminal, cursor is at (0, 0)
-  const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool)
+  const startY =
+    visibleOnly === true && frame.screen.height > frame.viewport.height
+      ? frame.screen.height - frame.viewport.height
+      : 0
+  // After clearTerminal, cursor is at (0, 0) — physically at the top of a
+  // blank viewport, virtually at content row startY (the slice's first row),
+  // so the slice renders without spurious leading LFs and the virtual end
+  // cursor lands at (0, height) exactly like a full repaint.
+  const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
+  renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
   return [{ type: 'clearTerminal', reason, debug }, ...screen.diff]
-}
-
-function renderFrame(
-  screen: VirtualScreen,
-  frame: Frame,
-  stylePool: StylePool,
-): void {
-  renderFrameSlice(screen, frame, 0, frame.screen.height, stylePool)
 }
 
 /**

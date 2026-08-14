@@ -7,16 +7,22 @@
  * slice repaint) write rows at stale physical offsets, leaving old status
  * rows behind and mixing old/new characters on the same lines.
  *
- * The fix: on shrink in main-screen mode, full-repaint via a scroll-up-to-top
+ * The fix: on shrink in main-screen mode, repaint via a scroll-up-to-top
  * clear sequence (CSI 10000 S) — no ESC[2J/ESC[3J (those snap the Windows
  * Terminal viewport to the top inside DEC 2026 sync blocks, claude-code
- * #35580), scrollback preserved.
+ * #35580), scrollback preserved. The repaint emits only the bottom VIEWPORT
+ * of rows: rows above are unreachable scrollback after the clear, and
+ * re-emitting them duplicated the whole transcript (splash header included)
+ * into scrollback on every turn-end shrink (issue #69). Emitting exactly
+ * one viewport of rows leaves the same visible bottom rows and the same
+ * virtual end cursor as a full repaint.
  *
  * Checks:
  *  1. the shrink frame emits the scroll-up clear (CSI 10000 S);
  *  2. the shrink frame emits NO ESC[2J / ESC[3J;
  *  3. the repainted frame contains the bottom-pinned marker text;
- *  4. the frame repaints ALL rows (full repaint, not a partial slice);
+ *  4. the frame repaints ALL VISIBLE rows (bottom viewport slice) and does
+ *     NOT re-emit scrolled-away rows above the viewport;
  *  5. the marker is in the LAST rows of the emitted frame (bottom-pinned).
  * Run: node scripts/verify-shrink.mjs
  */
@@ -85,9 +91,11 @@ function check(name, ok) {
   const first = stdout.frames.join('')
   check('initial frame has no clear sequence', !/\x1b\[2J\x1b\[3J/.test(first))
 
-  // Shrink: 60 -> 40 lines. Main-screen shrink must FULLY repaint (partial
-  // paths write at stale physical offsets → duplicated/mixed rows) via the
-  // scroll-up clear sequence (no ESC[2J/3J → no WT viewport jump).
+  // Shrink: 60 -> 40 lines. Main-screen shrink must repaint the visible
+  // viewport slice (partial paths write at stale physical offsets →
+  // duplicated/mixed rows) via the scroll-up clear sequence (no ESC[2J/3J →
+  // no WT viewport jump). Rows scrolled above the viewport are unreachable
+  // scrollback and must NOT be re-emitted (issue #69).
   instance.rerender(React.createElement(App, { lineCount: 40 }))
   await sleep(500)
   const shrink = stdout.frames[stdout.frames.length - 1]
@@ -113,9 +121,14 @@ function check(name, ok) {
       .replace(/\x1b\[[0-9;?>:]*[a-zA-Z]/g, '')
       .replace(/\x1b\]9;[^\x07]*\x07/g, '')
   check(
-    'shrink frame repaints ALL rows (full repaint)',
-    toPlain(shrink).includes('line 0 padded content') &&
+    'shrink frame repaints ALL VISIBLE rows (bottom viewport slice)',
+    toPlain(shrink).includes('line 13 padded content') &&
       toPlain(shrink).includes('line 39 padded content'),
+  )
+  check(
+    'shrink frame does NOT re-emit scrolled-away rows (issue #69)',
+    !toPlain(shrink).includes('line 0 padded content') &&
+      !toPlain(shrink).includes('line 12 padded content'),
   )
   const plain = toPlain(shrink)
   const linesOut = plain.split('\n')
