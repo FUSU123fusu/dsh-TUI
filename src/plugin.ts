@@ -121,87 +121,91 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     agentPreset,
     handle,
   })
-  // Single exit funnel: `/exit`, double Ctrl+C, and external teardown all
-  // land here. unmount() restores the terminal (cursor, raw mode, mouse
-  // tracking); the explicit newlines afterwards keep the shell prompt from
-  // overlapping the TUI's last line — the bare unmount left the cursor at
-  // the end of the final frame, so the prompt printed over it.
+  // Single exit funnel: `/exit` and double Ctrl+C land here, and so does
+  // the unmount triggered by a cordis context teardown — but the two must
+  // not share a fate (issue #12). The DSH launcher's boot-time recompose
+  // disposes every entry once; treating that teardown as a user exit killed
+  // the process before the recomposed tree could re-mount the TUI (the
+  // "flash back to bash with no error" symptom). Teardown only unmounts the
+  // UI; user exit runs the full leave sequence: unmount() restores the
+  // terminal (cursor, raw mode, mouse tracking) and the explicit newlines
+  // keep the shell prompt from overlapping the TUI's last line.
   let instance: Awaited<ReturnType<typeof render>> | undefined
-  let exited = false
   let updateRequested = false
   // The profile this process was booted with (`dsh --profile <name>`); dsh
   // exposes it nowhere else, and /update must update the installation the
   // user is actually running, not a hard-coded one.
   const profile = resolveDshProfileName()
-  const handleExit = (error?: unknown): void => {
-    if (exited) return
-    exited = true
-    try {
-      writeResumeTarget(channel.agentId)
-    } catch {
-      // Best effort — the resume marker is a launcher nicety; a stale
-      // marker must never block a clean exit.
-    }
-    try {
-      instance?.unmount()
-    } catch {
-      // The terminal state may already be gone (broken pipe, alt session);
-      // the exit path must never throw.
-    }
-    if (error !== undefined) {
-      // Error-driven unmount (render crash): stay loud and exit non-zero.
-      // A success code + resume hint here would tell wrappers/CI the
-      // session ended cleanly while the TUI actually crashed.
-      const message = error instanceof Error ? error.message : String(error)
-      ctx.logger.error(`cc-tui: exit after error: ${message}`)
-      if (process.stderr.isTTY) {
-        process.stderr.write(`\ncc-tui crashed: ${message}\n`)
+  const funnel = createExitFunnel({
+    onUserExit: error => {
+      try {
+        writeResumeTarget(channel.agentId)
+      } catch {
+        // Best effort — the resume marker is a launcher nicety; a stale
+        // marker must never block a clean exit.
       }
-      disposeRootAndExit(ctx, 1)
-      return
-    }
-    if (updateRequested) {
-      if (process.stdout.isTTY) {
-        process.stdout.write('\nUpdating dsh-cc-tui and restarting…\n')
+      try {
+        instance?.unmount()
+      } catch {
+        // The terminal state may already be gone (broken pipe, alt session);
+        // the exit path must never throw.
       }
-      disposeRootAndThen(ctx, () => {
-        // updateRequested only flips when onUpdate exists, which itself
-        // requires a resolved profile — narrow for the call below.
-        const updateProfile = profile
-        if (updateProfile === undefined) {
-          process.stderr.write('\ncc-tui update aborted: no dsh profile resolved.\n')
-          process.exit(1)
+      if (error !== undefined) {
+        // Error-driven unmount (render crash): stay loud and exit non-zero.
+        // A success code + resume hint here would tell wrappers/CI the
+        // session ended cleanly while the TUI actually crashed.
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.error(`cc-tui: exit after error: ${message}`)
+        if (process.stderr.isTTY) {
+          process.stderr.write(`\ncc-tui crashed: ${message}\n`)
         }
-        void updateTuiAndRestart(channel.agentId, updateProfile).then(
-          ({ updateCode, restartCode }) => {
-            if (updateCode !== 0) {
-              // The session survives: its log lives in DSH persistence and
-              // resume.txt was already written. A bare non-zero exit would
-              // drop the user into a shell with no way back in.
+        disposeRootAndExit(ctx, 1)
+        return
+      }
+      if (updateRequested) {
+        if (process.stdout.isTTY) {
+          process.stdout.write('\nUpdating dsh-cc-tui and restarting…\n')
+        }
+        disposeRootAndThen(ctx, () => {
+          // updateRequested only flips when onUpdate exists, which itself
+          // requires a resolved profile — narrow for the call below.
+          const updateProfile = profile
+          if (updateProfile === undefined) {
+            process.stderr.write('\ncc-tui update aborted: no dsh profile resolved.\n')
+            process.exit(1)
+          }
+          void updateTuiAndRestart(channel.agentId, updateProfile).then(
+            ({ updateCode, restartCode }) => {
+              if (updateCode !== 0) {
+                // The session survives: its log lives in DSH persistence and
+                // resume.txt was already written. A bare non-zero exit would
+                // drop the user into a shell with no way back in.
+                process.stderr.write(
+                  `\ncc-tui update failed (exit ${updateCode}). Your session is preserved — resume with:\n` +
+                    `${resumeCommand(profile, channel.agentId)}\n\n`,
+                )
+              }
+              process.exit(restartCode)
+            },
+            updateError => {
+              const message = updateError instanceof Error ? updateError.message : String(updateError)
               process.stderr.write(
-                `\ncc-tui update failed (exit ${updateCode}). Your session is preserved — resume with:\n` +
+                `\ncc-tui update failed: ${message}. Your session is preserved — resume with:\n` +
                   `${resumeCommand(profile, channel.agentId)}\n\n`,
               )
-            }
-            process.exit(restartCode)
-          },
-          updateError => {
-            const message = updateError instanceof Error ? updateError.message : String(updateError)
-            process.stderr.write(
-              `\ncc-tui update failed: ${message}. Your session is preserved — resume with:\n` +
-                `${resumeCommand(profile, channel.agentId)}\n\n`,
-            )
-            process.exit(1)
-          },
-        )
-      })
-      return
-    }
-    if (process.stdout.isTTY) {
-      process.stdout.write(`\nResume with (set the env var, then boot the profile):\n${resumeCommand(profile, channel.agentId)}\n\n`)
-    }
-    disposeRootAndExit(ctx, 0)
-  }
+              process.exit(1)
+            },
+          )
+        })
+        return
+      }
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\nResume with (set the env var, then boot the profile):\n${resumeCommand(profile, channel.agentId)}\n\n`)
+      }
+      disposeRootAndExit(ctx, 0)
+    },
+  })
+  const handleExit = funnel.handleExit
 
   const chat = React.createElement(Chat, {
     channel,
@@ -211,12 +215,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // `/update` to act on; source checkouts and `--config` overlays get the
     // unavailable notice instead.
     onUpdate: profile === undefined ? undefined : () => {
-      if (exited || updateRequested) return
+      if (funnel.hasExited() || updateRequested) return
       // Confirm the target version before tearing the TUI down: on an
       // already-latest install, an unconditional update+restart would churn
       // the process and then trip the "version did not advance" warning.
       void resolveTuiUpdateTarget().then((target) => {
-        if (exited || updateRequested) return
+        if (funnel.hasExited() || updateRequested) return
         if (target.kind === 'latest') {
           channel.notify(t('update-already-latest', { current: target.current }), { color: 'warning' })
           return
@@ -245,22 +249,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // A failed/offline check is intentionally silent; the manual `/update`
   // command remains available regardless of network access.
   void checkForTuiUpdate().then((update) => {
-    if (update === undefined || exited || updateRequested) return
+    if (update === undefined || funnel.hasExited() || updateRequested) return
     channel.notify(
       t('update-available', { current: update.current, latest: update.latest }),
       { color: 'warning', timeoutMs: 12000 },
     )
   })
 
-  // If the surrounding tree goes down (reload, teardown), take the TUI with it.
+  // If the surrounding tree goes down (reload, teardown), unmount the UI —
+  // but flag it as teardown first so the settling waitUntilExit does not
+  // run the user-exit sequence: no resume marker, no disposeRootAndExit,
+  // the process stays alive and the recomposed tree re-mounts the TUI.
   ctx.effect(() => () => {
+    funnel.markTeardown()
     instance?.unmount()
   })
 
-  // The TUI is the front door: when it unmounts (Ctrl+C), dispose the app
-  // tree and exit the process. The rejection handler covers error-driven
-  // unmounts — without it a rejected exitPromise became an unhandled
-  // rejection instead of a clean exit.
+  // The TUI is the front door: when the user unmounts it (Ctrl+C), dispose
+  // the app tree and exit the process. The rejection handler covers
+  // error-driven unmounts — without it a rejected exitPromise became an
+  // unhandled rejection instead of a clean exit. A teardown-driven settle
+  // is swallowed by the funnel (issue #12).
   void instance.waitUntilExit().then(handleExit, handleExit)
 }
 
@@ -343,6 +352,42 @@ async function resolveAgent(
     )
   })
   return { agent: created.agent, handle: created, agentPreset: composed.agentPreset }
+}
+
+/**
+ * Distinguish a user-driven exit from a cordis context teardown (issue #12).
+ *
+ * Both paths settle the Ink instance's exit promise, but only a user exit
+ * (`/exit`, double Ctrl+C, render crash) may leave the process. A teardown —
+ * the DSH launcher's boot-time recompose disposes every entry once — must
+ * only unmount the UI: the recomposed tree re-runs `apply` and mounts a
+ * fresh instance, so exiting here would kill the process mid-recompose
+ * (the "flash back to bash with no error" symptom).
+ *
+ * `markTeardown` must run before the unmount that settles the exit promise
+ * (the settle reaches `handleExit` through a microtask, so a same-tick flag
+ * is always observed). `hasExited` lets the `/update` flow observe the same
+ * latch the funnel enforces. Exported for scripts/verify-teardown-exit.tsx.
+ */
+export function createExitFunnel(deps: { onUserExit: (error?: unknown) => void }): {
+  handleExit: (error?: unknown) => void
+  markTeardown: () => void
+  hasExited: () => boolean
+} {
+  let exited = false
+  let teardown = false
+  return {
+    markTeardown: () => {
+      teardown = true
+    },
+    hasExited: () => exited,
+    handleExit: (error?: unknown) => {
+      if (teardown) return
+      if (exited) return
+      exited = true
+      deps.onUserExit(error)
+    },
+  }
 }
 
 /**
