@@ -69,3 +69,7 @@ jobs:
       # CJK 显示宽度截断回归（issue #41）：4 处描述按终端显示宽度处理，
       # CJK 不劈字、窄终端布局不破。
       - run: node --import tsx/esm scripts/verify-cjk-truncate.tsx
+
+      # 斜杠命令描述 i18n 回归（issue #41）：/ 菜单与 ? 帮助菜单描述随
+      # /lang 中英切换，外部命令查不到映射回退注册表原文，窄终端中文不劈字。
+      - run: node --import tsx/esm scripts/verify-i18n-command-descriptions.tsx
