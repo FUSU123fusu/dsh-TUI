@@ -1,12 +1,13 @@
 /**
  * Launcher contract for `dsh-cc --resume`: the TUI writes the chosen session
  * id to `~/.dsh-cc/resume.txt`, and the launcher feeds it back as
- * `DSH_CC_RESUME_SESSION`. Session *records* live in DSH's own persistence
- * backend (dsh-session-persistence-jsonl) — `/resume` lists those via
- * `sessionPersistence.list()`, this file only carries the id across
- * processes. It also keeps a small `last-used.json` of session-id → epoch-ms
- * touches so `/resume` can sort most-recently-used first (DSH session
- * headers carry only `createdAt`).
+ * `DSH_CC_RESUME_SESSION`. Session *records* live in cc-tui's own persistence
+ * store (dsh-session-persistence-sqlite at `~/.dsh-cc/sessions.sqlite`) —
+ * `/resume` lists those via `sessionPersistence.list()` and merges the shared
+ * dsh web / dsh CLI JSONL store via `sharedSessions.ts` (issue #24); this
+ * file only carries the id across processes. It also keeps a small
+ * `last-used.json` of session-id → epoch-ms touches so `/resume` can sort
+ * most-recently-used first (DSH session headers carry only `createdAt`).
  */
 import { homedir } from 'node:os'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'

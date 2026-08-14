@@ -12,6 +12,7 @@ import { registerPackagedSkills } from './packaged-skills.js'
 import { readActivityFrames } from './activityPrefs.js'
 import { readPresetPref } from './presetPrefs.js'
 import { composePreset, resolvePersistedPreset, runningPresetOf } from './presets.js'
+import { ensureSharedSessionImported, type ImportablePersistence } from './sharedSessions.js'
 import { writeResumeTarget } from './sessionHistory.js'
 import { Chat } from './screens/Chat.js'
 import { render, ThemeProvider, AlternateScreen } from './ui.js'
@@ -180,6 +181,29 @@ async function resolveAgent(
       })
       return { agent: resumed.agent, handle: resumed, agentPreset: composed.agentPreset }
     } catch (error) {
+      // The id may name a shared-store session (dsh web / dsh CLI — issue
+      // #24): materialize it into cc-tui's own store and retry once before
+      // falling back to a fresh session.
+      const imported = await ensureSharedSessionImported(
+        ctx.get('sessionPersistence') as ImportablePersistence | undefined,
+        requestedSessionId,
+      )
+      if (imported === 'imported') {
+        try {
+          const persisted = await resolvePersistedPreset(ctx, resumeId)
+          const composed = await composePreset(ctx, persisted)
+          const resumed = await ctx.agents.resume({
+            resumeSessionId: resumeId,
+            agentOptions,
+            ...(composed.setup === undefined ? {} : { setup: composed.setup }),
+          })
+          return { agent: resumed.agent, handle: resumed, agentPreset: composed.agentPreset }
+        } catch (retryError) {
+          ctx.logger.warn(
+            `cc-tui: resume of imported session "${requestedSessionId}" failed: ${retryError instanceof Error ? retryError.message : String(retryError)}`,
+          )
+        }
+      }
       // No artifact (first run / cleared storage) or persistence not
       // mounted: fall through to a fresh session, but stay loud in the log.
       ctx.logger.warn(
