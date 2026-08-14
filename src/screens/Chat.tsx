@@ -1253,6 +1253,7 @@ export function Chat({
           model={channel.model}
           effort={channel.reasoningEffort}
           cwd={channel.cwd}
+          whaleStyle={channel.whaleStyle}
         />
         {/* The startup loaded-context panel: before the first message the
             transcript is empty, so the collapsed summary of what this
