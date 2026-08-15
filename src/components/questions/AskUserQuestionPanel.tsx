@@ -2,7 +2,7 @@
  * The questionnaire panel — Claude Code style ask-user-question UI for the
  * DSH user-interaction seam. One question per panel (progress header, header
  * chip, wrapped question text, optional detail, option list with focus
- * pointer and multi-select checkmarks), styled in the cc-tui mist-blue
+ * pointer and multi-select checkmarks), styled in the dsh-tui mist-blue
  * design language.
  *
  * The list's last row IS the free-text input (issue #9): no Tab, no mode
@@ -183,7 +183,7 @@ export function AskUserQuestionPanel({
         setCustomCursor(customText.length)
         return
       }
-      if (!key.ctrl && !key.meta && input) {
+      if (!key.ctrl && !key.meta && !key.super && input) {
         setCustomText(text => text.slice(0, customCursor) + input + text.slice(customCursor))
         setCustomCursor(cursor => cursor + input.length)
         setError(null)
@@ -225,7 +225,7 @@ export function AskUserQuestionPanel({
     }
     // Typing on an option appends into the input row; single-select also
     // attaches this option's label so Enter carries label + text (#9).
-    if (!key.ctrl && !key.meta && input) {
+    if (!key.ctrl && !key.meta && !key.super && input) {
       appendText(input)
       if (!multiSelect) setAttached(options[focusIndex]?.label ?? null)
     }
