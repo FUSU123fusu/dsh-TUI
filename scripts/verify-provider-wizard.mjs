@@ -66,6 +66,9 @@ function makeDeps(script, options = {}) {
     listCatalogProviders: () => [
       { provider: 'deepseek', displayName: 'DeepSeek' },
       { provider: 'openai', displayName: 'OpenAI' },
+      // issue #228: displayName 与 provider id 相同的条目不应重复渲染
+      // description（白占一行）。这里制造一条同名的，断言见下方检查。
+      { provider: 'same-name', displayName: 'same-name' },
     ],
     routeExists: () => false,
     discoverModels: async () => {
@@ -91,6 +94,7 @@ function makeDeps(script, options = {}) {
       for (const question of request.questions) {
         calls.asks.push(question.id)
         calls.hideFlags[question.id] = question.hideCustomInput === true
+        if (question.id === 'catalog') calls.catalogOptions = question.options
         const spec = script[question.id]
         if (spec === undefined) throw new Error(`unscripted question: ${question.id}`)
         if (spec === 'cancel') throw CANCEL
@@ -150,6 +154,15 @@ const KEEP_MODEL = { selected: [t('provider-opt-switch-keep')] }
   check('1 catalog: transcript summary pushed without the key',
     calls.pushed.length === 1
       && calls.pushed[0].lines.every(line => !line.includes('sk-test-key')))
+  // issue #228 附带修复：displayName === provider id 的 catalog 条目不再带
+  // 重复 description；displayName 不同的条目保留 description。
+  const sameName = calls.catalogOptions?.find(o => o.label === 'same-name')
+  const deepseek = calls.catalogOptions?.find(o => o.label === 'deepseek')
+  check('1 catalog: displayName === id 的条目无重复 description',
+    sameName !== undefined && sameName.description === undefined,
+    JSON.stringify(sameName))
+  check('1 catalog: displayName 不同的条目保留 description',
+    deepseek?.description === 'DeepSeek', JSON.stringify(deepseek))
 }
 
 // 2. catalog, no models picked: models omitted, switch question skipped.

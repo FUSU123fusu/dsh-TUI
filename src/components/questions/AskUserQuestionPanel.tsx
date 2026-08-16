@@ -14,10 +14,12 @@
 
 import React from 'react'
 import { t } from '../../i18n.js'
-import { Box, Text, useInput } from '../../ui.js'
+import { Box, Text, useInput, useTerminalSize } from '../../ui.js'
 import { useDeclaredCursor } from '../../ink/hooks/use-declared-cursor.js'
 import { Divider } from '../design-system/Divider.js'
-import { POINTER } from '../../cc/figures.js'
+import { POINTER, UP_ARROW, DOWN_ARROW } from '../../cc/figures.js'
+import { stringWidth } from '../../ink/stringWidth.js'
+import { listWindow } from '../listWindow.js'
 import type { QuestionSelection } from '../../dsh-adapter/questions.js'
 import { PlanReviewPanel } from './PlanReviewPanel.js'
 import { isPlainReturnInput } from '../../utils/modifiers.js'
@@ -265,7 +267,7 @@ export function AskUserQuestionPanel({
 
   const cursorChar = customCursor < customText.length ? customText[customCursor] : ' '
   const renderInputRow = (): React.ReactNode => (
-    <Box flexDirection="row" marginTop={inputFocused ? 1 : 0}>
+    <Box flexDirection="row" marginTop={inputFocused && !windowed ? 1 : 0}>
       <Box width={1} flexShrink={0}>
         <Text color={inputFocused ? 'claude' : undefined} bold={inputFocused}>
           {inputFocused ? POINTER : ' '}
@@ -299,11 +301,18 @@ export function AskUserQuestionPanel({
 
   const renderOptions = (): React.ReactNode => (
     <Box flexDirection="column" marginTop={1}>
-      {options.map((option, index) => {
+      {windowed && windowStart > 0 && (
+        <Box flexDirection="row" marginLeft={3}>
+          <Text dimColor>{UP_ARROW}</Text>
+        </Box>
+      )}
+      {options.slice(windowStart, windowEnd).map((option, offset) => {
+        // 绝对下标：勾选集、提交与焦点都以全量列表为准，窗口只是切片。
+        const index = windowStart + offset
         const focused = index === focusIndex
         const selected = multiSelect ? checked.has(index) : focused
         return (
-          <Box key={option.label} flexDirection="row" marginTop={focused ? 1 : 0}>
+          <Box key={option.label} flexDirection="row" marginTop={focused && !windowed ? 1 : 0}>
             <Box width={1} flexShrink={0}>
               <Text color={focused ? 'claude' : undefined} bold={focused}>
                 {focused ? POINTER : ' '}
@@ -315,11 +324,11 @@ export function AskUserQuestionPanel({
               </Text>
             </Box>
             <Box flexDirection="column" marginLeft={1}>
-              <Text bold={focused || selected} color={focused ? 'claude' : undefined} wrap="wrap">
+              <Text bold={focused || selected} color={focused ? 'claude' : undefined} wrap={windowed ? 'truncate' : 'wrap'}>
                 {option.label}
               </Text>
               {option.description !== undefined && (
-                <Text dimColor wrap="wrap">
+                <Text dimColor wrap={windowed ? 'truncate' : 'wrap'}>
                   {option.description}
                 </Text>
               )}
@@ -327,6 +336,11 @@ export function AskUserQuestionPanel({
           </Box>
         )
       })}
+      {windowed && windowEnd < options.length && (
+        <Box flexDirection="row" marginLeft={3}>
+          <Text dimColor>{DOWN_ARROW}</Text>
+        </Box>
+      )}
       {hideCustomInput ? null : renderInputRow()}
     </Box>
   )
@@ -347,6 +361,40 @@ export function AskUserQuestionPanel({
         t('question-hint-esc'),
         ...(multiSelect && checked.size > 0 ? [t('question-hint-selected', { n: checked.size })] : []),
       ]
+
+  // ── 长选项焦点窗口化（issue #228）────────────────────────────────────
+  // 全量渲染时长列表会把焦点顶出视口并进终端滚动区。选项总高超预算时，
+  // 用 listWindow 围绕焦点切片（ModelPicker 同款）：窗口内 label/description
+  // 强制单行 truncate（行高可预测，预算才与真实渲染一致），焦点行的
+  // marginTop 也只在非窗口化时保留。短问卷维持原布局逐像素不变。
+  const { rows: terminalRows, columns: terminalColumns } = useTerminalSize()
+  /** 面板内容区宽度：面板 paddingLeft/Right 各 2。 */
+  const innerWidth = Math.max(terminalColumns - 4, 8)
+  const wrapLines = (text: string): number => Math.max(1, Math.ceil(stringWidth(text) / innerWidth))
+  const chromeRows =
+    1 /* 面板 marginTop */ + 1 /* Divider */ + 1 /* 头部块 marginTop */ +
+    (question.header === undefined ? 0 : 1) +
+    wrapLines(question.question) +
+    (question.detail === undefined
+      ? 0
+      : 1 /* detail marginTop */ + question.detail.split('\n').reduce((sum, line) => sum + wrapLines(line), 0)) +
+    1 /* 选项区 marginTop */ +
+    (error === null ? 0 : 2) +
+    1 /* 提示行 marginTop */ + wrapLines(hintParts.join(' · '))
+  /** 面板之外 Chat 自身的 chrome（状态行、工作行等）预留行。 */
+  const CHROME_RESERVE = 4
+  const inputRows = hideCustomInput ? 0 : 1
+  const optionHeights = options.map(option => (option.description === undefined ? 1 : 2))
+  const optionsTotal = optionHeights.reduce((sum, height) => sum + height, 0) + inputRows
+  const available = terminalRows - chromeRows - CHROME_RESERVE
+  const windowed = options.length > 0 && optionsTotal > available
+  // 窗口化后首尾还有 ↑/↓ 两行滚动提示，一并从选项预算里扣掉。
+  const optionBudget = Math.max(available - inputRows - (windowed ? 2 : 0), 1)
+  // 焦点在输入行（尾部追加行）时按最后一个选项取景：输入行恒在窗口下方
+  // 渲染，永远可见（IME caret 锚点也在它上面）。
+  const { start: windowStart, end: windowEnd } = windowed
+    ? listWindow(optionHeights, Math.min(focusIndex, options.length - 1), optionBudget)
+    : { start: 0, end: options.length }
 
   return (
     <Box flexDirection="column" marginTop={1} paddingLeft={2} paddingRight={2} width="100%">

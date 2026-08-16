@@ -177,9 +177,11 @@ export async function runProviderWizard(
         const otherLabel = t('provider-opt-other-route')
         const catalogAnswer = await ask({
           questions: [optionQuestion('catalog', t('provider-q-catalog'), [
+            // displayName 与 provider id 相同时不再重复渲染 description
+            // （issue #228：相同文本白占一行，长 catalog 下翻倍占高）。
             ...candidates.map(candidate => ({
               label: candidate.provider,
-              description: candidate.displayName,
+              ...(candidate.displayName === candidate.provider ? {} : { description: candidate.displayName }),
             })),
             { label: otherLabel, description: t('provider-opt-other-route-desc') },
           ], { hideCustomInput: true })],
