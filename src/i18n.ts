@@ -415,6 +415,20 @@ const dict = {
   'model-switching': { zh: '正在切换模型到 {{name}}…', en: 'Switching model to {{name}}…' },
   'model-switched': { zh: '模型已切换为 {{name}}', en: 'Model switched to {{name}}' },
 
+  // ── components/MarketPicker.tsx + screens/Chat.tsx（/market 插件市场）──
+  'picker-title-market': { zh: '插件市场', en: 'Plugin market' },
+  'market-loading': { zh: '正在加载插件市场', en: 'Loading the plugin market' },
+  'market-loading-subtitle': { zh: '正在查询 GitHub…', en: 'Querying GitHub…' },
+  'market-busy-hint': { zh: '正在安装，请稍候…', en: 'Installing, please wait…' },
+  'market-search-label': { zh: '搜索', en: 'Search' },
+  'market-search-placeholder': { zh: '输入以搜索插件…', en: 'Type to search…' },
+  'market-no-results': { zh: '没有匹配的插件', en: 'No matching plugins' },
+  'market-no-profile': { zh: '/market 仅在 `dsh --profile <名称>` 启动的实例中可用', en: '/market is only available in a `dsh --profile <name>` launch' },
+  'market-load-failed': { zh: '插件市场加载失败（网络错误或 GitHub API 限流）', en: 'Failed to load the plugin market (network error or GitHub API rate limit)' },
+  'market-install-ok': { zh: '插件已安装：{{name}}', en: 'Plugin installed: {{name}}' },
+  'market-restart-hint': { zh: '重启 dsh-tui 后插件生效。', en: 'Restart dsh-tui for the plugin to take effect.' },
+  'market-install-failed': { zh: '插件安装失败：{{name}}（退出码 {{code}}）', en: 'Plugin install failed: {{name}} (exit code {{code}})' },
+
   // ── components/RewindPicker.tsx ─────────────────────────────────────
   'rewind-title': { zh: '回退', en: 'Rewind' },
   'rewind-subtitle': { zh: '选择一条消息，将对话回退到该处', en: 'Pick a message to rewind the conversation to' },
@@ -590,6 +604,7 @@ const dict = {
   'cmd-desc-mcp': { zh: '查看 MCP 状态' },
   'cmd-desc-memory': { zh: '查看记忆状态' },
   'cmd-desc-update': { zh: '更新 dsh-tui 并重启' },
+  'cmd-desc-market': { zh: '浏览并安装 GitHub 上的 dsh 插件' },
   // Built-in skills
   'cmd-desc-audit': { zh: '对当前项目做全面代码审计' },
   'cmd-desc-bug': { zh: '记录一份 bug 报告' },

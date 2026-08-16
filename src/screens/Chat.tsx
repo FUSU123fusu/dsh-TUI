@@ -28,6 +28,9 @@ import { StatusLine } from './StatusLine.js'
 import { WorkingSpinner, useThinkingStatus } from '../components/WorkingSpinner.js'
 import { ActivityLine, contextPressurePct } from '../components/ActivityLine.js'
 import { ModelPicker } from '../components/ModelPicker.js'
+import { MarketPicker, MarketPickerLoading } from '../components/MarketPicker.js'
+import { installMarketPlugin, createMarketSearch, type MarketPlugin, type MarketSearch } from '../market.js'
+import { resolveDshProfileName } from '../update.js'
 import { SessionBrowser } from './SessionBrowser.js'
 import { WorkspacePicker } from '../components/WorkspacePicker.js'
 import { WorkspaceFlowPicker } from '../components/WorkspaceFlowPicker.js'
@@ -211,6 +214,15 @@ export function Chat({
   const [modelPickerOpen, setModelPickerOpen] = React.useState(false)
   const [models, setModels] = React.useState<readonly LlmModelInfo[]>([])
   const [modelIndex, setModelIndex] = React.useState(0)
+  /** `/market` plugin market: repo list loads async; busy while installing. */
+  const [marketPickerOpen, setMarketPickerOpen] = React.useState(false)
+  const [marketPlugins, setMarketPlugins] = React.useState<readonly MarketPlugin[]>([])
+  const [marketIndex, setMarketIndex] = React.useState(0)
+  const [marketBusy, setMarketBusy] = React.useState(false)
+  /** fzf 手感：picker 打开时打字即搜索，防抖后重新拉 GitHub。 */
+  const [marketQuery, setMarketQuery] = React.useState('')
+  const [marketLoading, setMarketLoading] = React.useState(false)
+  const marketSearchRef = React.useRef<MarketSearch | null>(null)
   /** `/resume` opens the session browser, a screen rather than a panel. It
    *  owns its own selection, filters and keyboard — Chat only opens it. */
   const [browserOpen, setBrowserOpen] = React.useState(false)
@@ -271,6 +283,23 @@ export function Chat({
     setBtw(null)
   }
   React.useEffect(() => () => btwAbortRef.current?.abort(), [])
+  /** `/market` 搜索驱动（防抖 + 竞态丢弃在 market.ts）；结果直接落 state。 */
+  const getMarketSearch = (): MarketSearch =>
+    (marketSearchRef.current ??= createMarketSearch((result) => {
+      setMarketLoading(false)
+      if (result === undefined) {
+        channel.notify(t('market-load-failed'), { color: 'error' })
+        return
+      }
+      setMarketPlugins(result)
+    }))
+  // 查询词变化 → 防抖重搜。打开时 case 'market' 已做 immediate 首拉，
+  // createMarketSearch 的去重会跳过这里重复的 ''。
+  React.useEffect(() => {
+    if (!marketPickerOpen) return
+    getMarketSearch().search(marketQuery)
+  }, [marketQuery, marketPickerOpen])
+  React.useEffect(() => () => marketSearchRef.current?.dispose(), [])
   /**
    * The trajectory scene (issue #80 evolution). Unlike every other overlay
    * here it is not a panel but a whole screen: while open, Chat renders the
@@ -714,6 +743,26 @@ export function Chat({
           setModelIndex(index >= 0 ? index : 0)
         })
         return true
+      case 'market': {
+        // Plugin market: GitHub topic search fills the picker; typing in the
+        // picker re-searches (debounced, see the marketQuery effect above);
+        // Enter installs into the current profile (`dsh plugin add
+        // github:o/r`). Non-profile launches have no profile installation to
+        // act on — same gate as /update.
+        setHelpOpen(false)
+        if (resolveDshProfileName() === undefined) {
+          channel.notify(t('market-no-profile'), { color: 'error' })
+          return true
+        }
+        setMarketPlugins([])
+        setMarketIndex(0)
+        setMarketBusy(false)
+        setMarketQuery('')
+        setMarketLoading(true)
+        setMarketPickerOpen(true)
+        getMarketSearch().search('', true)
+        return true
+      }
       case 'provider': {
         // Interactive add-provider wizard (/provider): drives the shared
         // question panel, persists profile + key via the channel's settings/
@@ -1543,6 +1592,61 @@ export function Chat({
       }
       return
     }
+    if (marketPickerOpen) {
+      // busy 期间锁住方向键、Enter 与搜索输入（防重复安装/查询词漂移），
+      // Esc 仍可关浮层——安装结果走 notify/pushLocal 报告，不依赖 picker 存活。
+      if (key.escape) {
+        setMarketPickerOpen(false)
+        marketSearchRef.current?.dispose()
+      } else if (!marketBusy && marketPlugins.length > 0 && key.upArrow) {
+        setMarketIndex(index => (index <= 0 ? marketPlugins.length - 1 : index - 1))
+      } else if (!marketBusy && marketPlugins.length > 0 && key.downArrow) {
+        setMarketIndex(index => (index >= marketPlugins.length - 1 ? 0 : index + 1))
+      } else if (!marketBusy && key.backspace) {
+        if (marketQuery.length > 0) {
+          setMarketQuery(marketQuery.slice(0, -1))
+          setMarketIndex(0)
+        }
+      } else if (!marketBusy && plainReturn) {
+        const plugin = marketPlugins[marketIndex]
+        const profile = resolveDshProfileName()
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
+        if (plugin && profile !== undefined) {
+          setMarketBusy(true)
+          channel.notify(t('market-busy-hint'))
+          void installMarketPlugin(profile, plugin.fullName).then((result) => {
+            setMarketBusy(false)
+            setMarketPickerOpen(false)
+            if (result.code === 0) {
+              channel.notify(t('market-install-ok', { name: plugin.fullName }), { color: 'success' })
+              channel.pushLocal('/market', [
+                t('market-install-ok', { name: plugin.fullName }),
+                t('market-restart-hint'),
+              ])
+            } else {
+              channel.notify(
+                t('market-install-failed', { name: plugin.fullName, code: result.code ?? 1 }),
+                { color: 'error' },
+              )
+              const stderrTail = result.stderr.trim().split('\n').filter(Boolean).slice(-3)
+              channel.pushLocal('/market', [
+                t('market-install-failed', { name: plugin.fullName, code: result.code ?? 1 }),
+                ...stderrTail,
+              ])
+            }
+          })
+        }
+      } else if (!marketBusy && !key.ctrl && !key.meta && !key.super && input) {
+        // fzf 手感：picker 打开时打字即进搜索词（剥掉控制字符，如未经
+        // plainReturn 拦截的 \r），防抖重搜走上面的 marketQuery effect。
+        const typed = input.replace(/[\x00-\x1f]/g, '')
+        if (typed !== '') {
+          setMarketQuery(marketQuery + typed)
+          setMarketIndex(0)
+        }
+      }
+      return
+    }
     if (historyOpen) {
       if (key.escape) {
         setHistoryOpen(false)
@@ -1725,7 +1829,7 @@ export function Chat({
 
   /** Prompt input is inert while a modal dialog owns the keyboard. */
   const promptSelectionActive =
-    selectionActive || modelPickerOpen || workspacePickerOpen || workspaceFlow !== null || activityPickerOpen ||
+    selectionActive || modelPickerOpen || marketPickerOpen || workspacePickerOpen || workspaceFlow !== null || activityPickerOpen ||
     effortSliderOpen || presetPickerOpen || themePickerOpen || thinkingOpen || historyOpen || rewindOpen || searchOpen ||
     btw !== null
 
@@ -1749,7 +1853,7 @@ export function Chat({
   // blit-skip 后留空（Esc 关 picker 一片空白的根因）。
   const dialogOverlayOpen =
     thinkingOpen || (workspacePickerOpen && workspaceTargets.length > 0) || workspaceFlow !== null ||
-    modelPickerOpen ||
+    modelPickerOpen || marketPickerOpen ||
     activityPickerOpen || (effortSliderOpen && effortOptions.length > 1) ||
     (presetPickerOpen && presetOptions.length > 0) || themePickerOpen || historyOpen ||
     rewindOpen || searchOpen
@@ -1981,6 +2085,20 @@ export function Chat({
           {themePickerOpen && (
             <Box flexDirection="column" marginTop={1}>
               <ThemePicker focusIndex={themeIndex} currentTheme={themeName} />
+            </Box>
+          )}
+          {marketPickerOpen && (
+            <Box flexDirection="column" marginTop={1}>
+              {marketLoading && marketPlugins.length === 0 ? (
+                <MarketPickerLoading />
+              ) : (
+                <MarketPicker
+                  plugins={marketPlugins}
+                  focusIndex={marketIndex}
+                  busy={marketBusy}
+                  query={marketQuery}
+                />
+              )}
             </Box>
           )}
           {historyOpen && (

@@ -97,6 +97,7 @@ export const LOCAL_COMMANDS: LocalCommand[] = [
   { name: 'mcp', description: 'Show MCP status' },
   { name: 'memory', description: 'Show memory status' },
   { name: 'update', description: 'Update dsh-tui and restart' },
+  { name: 'market', description: 'Browse and install dsh plugins from GitHub' },
   // Built-in skills (CC's skill commands, driven through DSH skills)
   { name: 'audit', description: 'Run a comprehensive code audit on this project' },
   { name: 'bug', description: 'Capture a bug report' },
