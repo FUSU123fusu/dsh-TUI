@@ -58,8 +58,14 @@ export function LoadedContextPanel({
   return (
     <Box flexDirection="column" marginTop={1} marginBottom={1}>
       <Box paddingX={1} backgroundColor={open ? 'userMessageBackground' : undefined}>
-        <Text bold={open}>{open ? '▼' : '▶'} {t('context-loaded')} · {summary}</Text>
-        <Text dimColor> （Ctrl+T{open ? t('context-panel-collapse') : t('context-panel-expand')}）</Text>
+        {/* Single wrapping Text (issue #167): two sibling Texts let a long
+            summary wrap while the hint stayed anchored inline, interleaving
+            both into gibberish on narrow terminals. One Text wraps as a
+            single paragraph — every character survives, in order. */}
+        <Text wrap="wrap" bold={open}>
+          {open ? '▼' : '▶'} {t('context-loaded')} · {summary}
+          <Text dimColor> （Ctrl+T{open ? t('context-panel-collapse') : t('context-panel-expand')}）</Text>
+        </Text>
       </Box>
       {open && (
         <Box flexDirection="column" paddingX={1} paddingTop={1}>
