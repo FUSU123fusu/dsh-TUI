@@ -36,6 +36,27 @@
 import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
+
+// Windows Defender / the search indexer briefly hold freshly written temp
+// files, so the atomic commit's rename(tmp -> dest) intermittently fails with
+// EPERM on win32 (seen in the verify battery and on dev machines). Retry a
+// few times with backoff — graceful-fs does the same for the same reason.
+async function writeFileAtomicRetry(
+  ...args: Parameters<typeof writeFileAtomic>
+): Promise<void> {
+  const maxAttempts = 5
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await writeFileAtomic(...args)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if ((code !== 'EPERM' && code !== 'EBUSY') || attempt >= maxAttempts) {
+        throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 50 * attempt))
+    }
+  }
+}
 import { Context, Service } from '@deepseek-ai/cordis'
 import {
   validateDeleteInput,
@@ -408,7 +429,7 @@ export class TuiPluginStorageRuntime extends Service {
             throw new PluginStorageError('QUOTA_EXCEEDED', `storage namespace "${plugin}" would exceed ${STORAGE_MAX_BYTES} bytes`)
           }
           // 0o600/0o700: the namespace is privacyClass sensitive.
-          await writeFileAtomic(file, content, { mode: 0o600, dirMode: 0o700 })
+          await writeFileAtomicRetry(file, content, { mode: 0o600, dirMode: 0o700 })
           const output = { stored: true as const }
           validateSetOutput(output)
           return output
@@ -428,7 +449,7 @@ export class TuiPluginStorageRuntime extends Service {
             return output
           }
           delete table[key]
-          await writeFileAtomic(file, JSON.stringify(table), { mode: 0o600, dirMode: 0o700 })
+          await writeFileAtomicRetry(file, JSON.stringify(table), { mode: 0o600, dirMode: 0o700 })
           const output = { deleted: true }
           validateDeleteOutput(output)
           return output
