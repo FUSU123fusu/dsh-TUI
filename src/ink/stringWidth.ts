@@ -5,6 +5,28 @@ import { getGraphemeSegmenter } from '../utils/intl.js'
 
 const EMOJI_REGEX = emojiRegex()
 
+// Classic Windows conhost measures glyph widths from the console font, and
+// under DBCS codepages (936/932/949/950 — the only fonts selectable there are
+// CJK ones) East-Asian Ambiguous characters (·, →, ●, ◆, …) render as TWO
+// cells while the Unicode default counts them as one. Every line containing a
+// separator then paints wider than the layout model, the terminal wraps where
+// ink did not expect, and each repaint drifts a row (duplicate/stale frames,
+// #344). Modern terminals (Windows Terminal sets WT_SESSION, VSCode sets
+// TERM_PROGRAM, mintty/WezTerm/Alacritty set TERM or TERM_PROGRAM) all use
+// narrow-ambiguous xterm semantics, so only flip when none of those markers
+// exist. DSH_AMBIGUOUS_WIDTH=wide|narrow overrides the detection.
+const ambiguousAsWide = (() => {
+  const override = process.env.DSH_AMBIGUOUS_WIDTH
+  if (override === 'wide') return true
+  if (override === 'narrow') return false
+  return (
+    process.platform === 'win32' &&
+    !process.env.WT_SESSION &&
+    !process.env.TERM_PROGRAM &&
+    !process.env.TERM
+  )
+})()
+
 /**
  * Fallback JavaScript implementation of stringWidth when Bun.stringWidth is not available.
  *
@@ -13,9 +35,10 @@ const EMOJI_REGEX = emojiRegex()
  * This is a more accurate alternative to the string-width package that correctly handles
  * characters like ⚠ (U+26A0) which string-width incorrectly reports as width 2.
  *
- * The implementation uses eastAsianWidth directly with ambiguousAsWide: false,
- * which correctly treats ambiguous-width characters as narrow (width 1) as
- * recommended by the Unicode standard for Western contexts.
+ * The implementation uses eastAsianWidth directly with the `ambiguousAsWide`
+ * mode selected above: narrow everywhere except classic Windows conhost under
+ * a DBCS codepage, where the console font renders ambiguous characters wide
+ * (#344).
  */
 function stringWidthJavaScript(str: string): number {
   if (typeof str !== 'string' || str.length === 0) {
@@ -58,7 +81,7 @@ function stringWidthJavaScript(str: string): number {
     for (const char of str) {
       const codePoint = char.codePointAt(0)!
       if (!isZeroWidth(codePoint)) {
-        width += eastAsianWidth(codePoint, { ambiguousAsWide: false })
+        width += eastAsianWidth(codePoint, { ambiguousAsWide })
       }
     }
     return width
@@ -80,7 +103,7 @@ function stringWidthJavaScript(str: string): number {
     for (const char of grapheme) {
       const codePoint = char.codePointAt(0)!
       if (!isZeroWidth(codePoint)) {
-        width += eastAsianWidth(codePoint, { ambiguousAsWide: false })
+        width += eastAsianWidth(codePoint, { ambiguousAsWide })
         break
       }
     }
@@ -275,7 +298,7 @@ const bunStringWidth =
     ? Bun.stringWidth
     : null
 
-const BUN_STRING_WIDTH_OPTS = { ambiguousIsNarrow: true } as const
+const BUN_STRING_WIDTH_OPTS = { ambiguousIsNarrow: !ambiguousAsWide } as const
 
 /**
  * Get the display width of a string as it would appear in a terminal.
