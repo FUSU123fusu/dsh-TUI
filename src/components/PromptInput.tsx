@@ -265,7 +265,8 @@ export function PromptInput({
   // Double-tap Esc to clear (CC semantics).
   const escPendingRef = React.useRef(false)
   const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  /** True while a Ctrl+V clipboard read is in flight (ignore repeat keys). */
+  /** True while a clipboard paste read is in flight — guards both Ctrl+V
+   *  and Alt+V (ignore repeat keys). */
   const clipboardBusyRef = React.useRef(false)
   /** True while the external editor owns the terminal (Ctrl+G round-trip). */
   const editorBusyRef = React.useRef(false)
@@ -546,10 +547,11 @@ export function PromptInput({
       return
     }
 
-    // Ctrl+V / Cmd+V: raw mode hands the key to the app, so the clipboard is
-    // read here — text, file paths when the file manager copied files, or an
-    // exported temp-file path when the clipboard holds a raw image.
-    if (isMod(key) && input === 'v') {
+    // Clipboard paste, shared by Ctrl+V and Alt+V. Raw mode hands the key
+    // to the app, so the clipboard is read here — text, file paths when the
+    // file manager copied files, or an exported temp-file path when the
+    // clipboard holds a raw image (staged as an image attachment).
+    const pasteClipboard = () => {
       if (clipboardBusyRef.current) return
       // Match insertAtCaret's overlay/selection dismissal up front: the
       // async continuation below only sets value/cursor, so a paste landing
@@ -596,15 +598,32 @@ export function PromptInput({
           channel.notify(t('input-clipboard-read-failed'), { color: 'warning' })
         })
         .finally(() => {
-          // A rejected read must never wedge Ctrl+V for the rest of the
-          // session.
+          // A rejected read must never wedge clipboard paste for the rest
+          // of the session.
           clipboardBusyRef.current = false
         })
+    }
+
+    // Ctrl+V / Cmd+V: the primary clipboard-paste binding.
+    if (isMod(key) && input === 'v') {
+      pasteClipboard()
       return
     }
 
-    // Help is modal for modified keys and every Enter variant. Ctrl+V above
-    // is the intentional exception: paste closes Help and inserts visibly.
+    // Alt+V: same paste, alternate binding. Desktop terminals commonly own
+    // Ctrl+V themselves (Windows Terminal binds it to a text-only paste, so
+    // an image-only clipboard produces NO event at all — the keystroke never
+    // reaches the app), and Cmd+V is the macOS system paste. Alt+V passes
+    // through everywhere, so a clipboard image stays reachable even where
+    // Ctrl+V is swallowed. Pure alias: behavior is identical to Ctrl+V.
+    if (key.meta && input === 'v') {
+      pasteClipboard()
+      return
+    }
+
+    // Help is modal for modified keys and every Enter variant. Ctrl+V/Alt+V
+    // above are the intentional exception: paste closes Help and inserts
+    // visibly.
     // Swallow here before editor/submit/interrupt branches can mutate hidden
     // composer or working-turn state; plain typing still dismisses Help below.
     if (helpOpen && !key.escape && (key.ctrl || key.meta || key.super || key.return || input.includes('\n') || input.includes('\r'))) {

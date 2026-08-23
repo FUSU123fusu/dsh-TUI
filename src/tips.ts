@@ -145,8 +145,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'keys-paste',
     group: 'keys',
-    zh: 'Ctrl+V 粘贴文本、文件路径或图片附件',
-    en: 'Ctrl+V pastes text, file paths, or image attachments',
+    zh: 'Ctrl+V 粘贴文本、文件路径或图片附件；终端吞掉 Ctrl+V 时（如 Windows Terminal）用 Alt+V',
+    en: 'Ctrl+V pastes text, file paths, or image attachments; if the terminal swallows Ctrl+V (e.g. Windows Terminal), use Alt+V',
   },
   {
     id: 'keys-slash-search',
