@@ -9,21 +9,25 @@
 | `Enter` | Send while idle; steer text into the running turn at its next step boundary; confirm an open menu |
 | `Tab` | Complete a `/` command or `@` file; while the model is working, queue non-empty input as a post-turn follow-up |
 | `Ctrl+Enter` | Interrupt the running turn and process the input immediately |
-| `Shift+Enter` | Insert a newline at the caret |
+| `Shift+Enter` / `Ctrl+J` | Insert a newline at the caret; `Ctrl+J` (LF) is the fallback when the terminal cannot report the Shift modifier; macOS Terminal.app uses `Option+Enter` |
 | `Shift+Tab` | Cycle the configured session modes (default: default → plan → full-access) |
 | `Alt/Option+Up` | Pull the latest undelivered message back into the editor |
 | `Up/Down` | Select menu items; in ordinary input, browse history or move through multiline text |
-| `Ctrl+V` | Insert clipboard text or files; images are sent as durable attachments |
-| `Ctrl+X` | Edit the current input in an external editor (`$VISUAL` → `$EDITOR` → vi); saving and quitting fills it back, `:cq`/non-zero exit keeps the draft |
-| `Esc` | Close the active menu, selection, or modal; clear input; interrupt a working model; double-tap on empty input to rewind |
+| `Ctrl+V` / `Alt+V` | Insert clipboard text or files; images are sent as durable attachments. Use `Alt+V` when the terminal intercepts `Ctrl+V` |
+| `Ctrl+G` | Edit the current input in an external editor (`$VISUAL` → `$EDITOR`); saving and quitting fills it back, `:cq`/non-zero exit keeps the draft; with neither variable set the TUI asks you to configure one (no `vi` fallback) |
+| `Esc` | Ladder: close help → close the command menu → close the file menu (only the current `@` token) → interrupt the turn and redeliver pending messages → clear non-empty input → double-tap on empty input = rewind; in fullscreen, an active mouse selection is cleared first (not copied) |
 | `Ctrl+C` | Interrupt while working; clear non-empty idle input; press twice on empty input to exit |
 | `Ctrl+D` | Press twice while idle to exit |
 | `Ctrl+O` | Toggle transcript/verbose detail, including full reasoning and tool arguments/output |
+| `Ctrl+P` | Toggle the loaded-context panel shown at startup (while it is on screen) |
 | `Ctrl+T` | Open the trajectory scene (same as `/trace`); `q`/`Esc` returns to the conversation |
 | `Ctrl+R` | Open input-history search; repeat or press `Down` for the next result |
 | `Ctrl+L` | Clear and force a physical terminal redraw |
 | `?` | Open shortcut and command help when the input is empty |
+| In Help: `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll by line, page, or jump to either end; `Esc` closes |
 | `Shift+Up` | Enter message selection; arrows move, `Enter` expands one row, `Esc` exits |
+
+The action shortcuts (paste, history search, external editor, `Ctrl+O/T/P/R/L`, subagent dashboard, show-all, todo fold) are remappable in `/settings` → `dsh-tui` → `Shortcuts`: enter combos such as `alt+v`, comma-separate several, leave blank to restore defaults — saves apply live. Combos clashing with the fixed editing keys or another action are rejected. Deployments can also pin them via `shortcuts.<action>` in cordis.yml.
 
 `/` has two meanings. In normal input it opens slash-command completion. In
 the `Ctrl+O` transcript view it opens full-session search; use `n` and `N` to
@@ -54,8 +58,14 @@ inserted verbatim, including newlines, and is never mistaken for an Enter key.
 ## @ file references
 
 Typing `@` at **any position** of the message opens file completion: keep typing
-path fragments to filter, `Tab`/`Enter` to pick, and directories can be entered
-further. Text files and directory listings are attached as text; PNG, JPEG, WebP,
+to filter, `Tab`/`Enter` to pick, and directories can be entered
+further (plain fragments match **fuzzily** — `@ment` matches
+`src/utils/mentions.ts`, with prefix/boundary and short-path boosts; path-shaped
+queries — `@src/`, `@./`, `@../`, `@~/`, `@D:\`, or anything containing a
+separator — read **only that directory** for local completion. `Esc` closes only
+the current `@` token's menu; async refreshes keep your selected candidate).
+Text files
+and directory listings are attached as text; PNG, JPEG, WebP,
 and GIF files are sent as durable Harness image blocks. Reads use the active
 workspace filesystem, including provider-owned workspaces.
 
@@ -141,6 +151,14 @@ selection is confirmed, the TUI:
 3. Replays history before the boundary.
 4. Restores the original message to the editor for revision and resubmission.
 
+- The boundary is taken **before** the turn that contained the message; you
+  **cannot rewind past the first message**.
+- If the model is working, the TUI cancels the turn first and waits for it to
+  settle (up to 30s).
+- The rewound branch is not a sub-agent (it records `parentSession` without
+  `origin`) and keeps using the current model route plus the session's own
+  preset.
+
 Plugins can intervene (`tui/rewind-prompt` decision event): veto the rewind
 (with a reason), or offer extra rewind modes in the confirm pane — e.g.
 "rewind the conversation AND restore the files changed since". The first
@@ -162,6 +180,34 @@ answer in a scrollable panel. Notes:
   model is streaming; the main task keeps going.
 - Inside the panel: `↑`/`↓` scroll, `Space`/`Enter`/`Esc` dismiss, `c`
   copies the answer; `Esc` cancels while the answer is still pending.
+- Triggering `/btw` again aborts the previous side question.
+
+### Trajectory scene (/trace / Ctrl+T)
+
+A full-screen scene (no scrollback pollution) over the whole session timeline:
+
+| Key | Action |
+| --- | --- |
+| `←`/`→` (or `h`) | Switch timeline / hotspot view |
+| `↑` `↓` / `PgUp` `PgDn` | Move, page |
+| `[` / `]` | Jump to previous / next failed point |
+| `{` / `}` | Jump to previous / next turn |
+| `/` | Query line: `tool:` `kind:` `turn:` `err:` `run:` `>10s` `tok>1k` prefixes, ANDed together; hits highlight in place |
+| `m` | Cycle projection modes (equal / wall-clock / collapsed idle) |
+| `g` / `G` | Jump to top / bottom |
+| `Enter` | Expand details; `j`/`k` page inside the details |
+| `t` (hotspot view) | Cycle sorting (time / count / tokens) |
+| `q` / `Esc` | Exit; Esc is layered: fold details → clear query → close |
+
+### /settings editor
+
+`/settings` opens the plugin settings editor, read/edit by namespace. Editing
+is **staged**: `↑`/`↓` to move, `Enter` to expand/toggle/edit, `s` saves /
+`d` discards / `Esc` first drops dirty sections, then exits. Fields under the
+dsh-tui namespace are written to the user layer of settings.yaml and take
+**effect immediately** (`lang`, `statusBar.*`, …); namespaces without a
+declared TUI section are listed read-only and need manual edits to
+`~/.dsh/settings.yaml`.
 
 ### Model and preset
 
@@ -202,10 +248,25 @@ owns native scrollback and selection.
 
 | Action | Behavior |
 | --- | --- |
-| Wheel | Scroll the transcript |
+| Wheel | Routed by position: moves the selected row in the completion/command menu under the pointer; scrolls the topmost scroll container (transcript / help / subagent panel); elsewhere scrolls the message list; never scrolls the transcript behind an open overlay; moves the cursor in the trajectory scene (±3 rows per notch on the timeline, ±1 in hotspot, scrolls the detail while expanded); walks the focused row in /settings |
 | Drag | Select text, copy on release, then clear the selection |
 | Double/triple click | Select and copy a word/line |
-| `Esc` | Cancel an active drag without copying |
+| `Esc` | Cancel an active drag (or an existing selection) without copying |
+| Single-click a message row | Plain text rows (user/assistant) do nothing — the transcript is a reading surface, selection is the mouse's job there |
+| Single-click a tool card / thinking / compact summary | Expand / collapse (header brightens on hover; trailing blank cells do not trigger) |
+| Single-click a subagent card | Open that subagent's detail scene (status glyph brightens on hover) |
+| Single-click the input box | Place the text caret at the click (multi-line, wrapped rows and CJK all width-aligned) |
+| Single-click “load earlier messages” / “ctrl+e show previous N” | Load earlier messages / expand all |
+| Single-click the sticky header / “↓ N new messages” | Jump back to the pinned message / scroll to bottom |
+| Single-click a hyperlink | Open it in the browser |
+| Single-click a picker / menu row | Select and apply immediately (model / skills / activity frames / preset / permissions / plan / language / theme / effort / command & file completion / history / session rows / thinking mode / workspace targets, submenu & flow choices) — the keyboard Enter path; rows are inert while a picker is busy or mid-input |
+| Single-click a rewind candidate / confirm row | List page: click selects only (stepping into the confirm state stays an explicit keyboard Enter); confirm page: clicking the message / mode row executes the rewind directly — the confirm pane is itself the confirmation layer |
+| Single-click an approval / questionnaire / plan-review / plugin dialog row | Submit that decision directly (unblock a waiting agent with the mouse) |
+| Single-click in the trajectory scene | Timeline/hotspot rows jump the cursor (a hotspot row jumps back to the timeline at that group — same as Enter; hover shows a dim ▸ pointer); tabs switch views; the sort/projection label cycles; the query line and the tab gap open the `/` search; a wave-band column (ruler included) jumps to its nearest event |
+| Single-click a /settings field / group row | Focus it and run that row's Enter action (boolean/select cycles, text enters edit, groups open); hover moves the focus (lazygit-style); the edit mode ignores the mouse entirely |
+| Single-click a session-browser confirm row | Confirm the delete/clean (same as Enter); cancelling stays on keyboard Esc |
+| Single-click a help-menu command row | Fill `/name ` into the prompt and close the help (the Tab completion's mouse equivalent) |
+| Keyboard selection extension | With a selection, `Shift+←/→/↑/↓/Home/End` extends / shrinks it (wraps across lines) |
 
 Copy prefers OSC 52. Local fallbacks include `wl-copy`, `xclip`, and `xsel`;
 tmux uses `load-buffer -w`. Set `DSH_TUI_DISABLE_MOUSE=1` to temporarily disable
@@ -222,7 +283,13 @@ keyboard:
 | `Space` | Toggle a multi-select option |
 | `Tab` | Switch to a custom text answer |
 | `Enter` | Submit the current question |
-| `Esc` | Cancel the whole batch of questions; the model receives `ASK_CANCELLED` (a harness-side abort still reports `ASK_ABORTED`) |
+| `Esc` (from question 2 onward) | Return to the previous question and keep the current draft |
+| `Esc` (from question 1) | Cancel the whole batch; the model receives `ASK_CANCELLED` |
+| `Ctrl+C` | Cancel the whole batch from any question; the model receives `ASK_CANCELLED` (a harness-side abort still reports `ASK_ABORTED`) |
+
+The last row is a free-form input line: typing directly on an option row
+submits that option's label **plus** your custom text together (no need to
+`Tab` first); `Tab` jumps straight to the input line.
 
 Batched questions and concurrent subagent questions are shown one at a time in
 FIFO order. A compact Q&A summary is added to the local transcript afterward.
@@ -256,6 +323,8 @@ pending, approval takes priority):
 | `Enter` | Submit the focused item |
 | `Esc` / `Ctrl+C` | Deny (fail closed) |
 
+The protocol offers only "allow once / deny" — there is **no "always allow"**.
+
 ## Slash commands
 
 The command menu merges local commands with the DSH command registry. Type `/`
@@ -266,23 +335,31 @@ zh; unmapped registry commands fall back to the registry's own text.
 
 | Group | Commands |
 | --- | --- |
-| Sessions | `/new`, `/resume`, `/rename`, `/workspace resume|rename|open`, `/clear`, `/compact`, `/export`, `/btw`, `/trace` (trajectory scene, also `Ctrl+T`) |
-| Status | `/context`, `/status`, `/cost`, `/config`, `/doctor`, `/init`, `/agents` |
+| Sessions | `/new`, `/resume`, `/rename`, `/workspace resume|rename|open`, `/clear`, `/compact`, `/export`, `/btw`, `/trace` (trajectory scene, also `Ctrl+T`), `/rewind` (time travel, same as double-`Esc` on an empty input) |
+| Status | `/context`, `/status`, `/cost`, `/config`, `/doctor`, `/init`, `/agents`, `/settings` |
 | Model and display | `/model`, `/effort`, `/thinking`, `/tokens`, `/activity`, `/preset`, `/theme`, `/lang` |
-| Account and policy | `/provider`, `/login`, `/logout`, `/permissions`, `/add-dir`, `/hooks`, `/mcp` |
+| Account and policy | `/provider`, `/login`, `/logout`, `/permissions`, `/add-dir`, `/hooks`, `/mcp`, `/skills`, `/plugins` (`check <path>` validates a plugin manifest) |
 | Packaged skills | `/audit`, `/bug`, `/practice`, `/review`, `/pr_comments`, `/release-notes`, `/vuln-check` |
-| Other | `/update`, `/vim`, `/terminal-setup`, `/connect`, `/help`, `/exit` |
+| Other | `/update`, `/vim`, `/terminal-setup`, `/connect`, `/help`, `/exit` (aliases `/quit`, `/q`) |
 | Registry | `/plan`, `/goal`, and any other command registered by the DSH composition |
 
 Additional forms:
 
 - `/activity` opens the animation picker; `/activity frames <name>` selects
-  directly; `/activity status` reports the current choice.
+  directly (30 frame names: `random` + `claude` `star2` `sand` `triangle`
+  `box` `box2` `corners` `point` `layer` `flip` `aesthetic` `hamburger`
+  `moon` `moon8` `comet` `breathe` `dots` `arrow` `spark` `bar` `braille`
+  `arc` `circle` `grow` `noise` `bounce` `rainbow` `dqpb` `toggle`; default
+  `moon8`); `/activity status` reports the current choice.
 - `/preset <id>` and `/preset status` are described in the configuration guide.
 - `/effort` opens the reasoning-effort slider (←/→ adjusts live);
   `/effort <id>` sets a level directly; `/effort status` reports the current one.
 - `/theme <name>` and `/theme status` are described in the theme guide.
 - `/lang` toggles the interface language (see “Interface language”).
+- `/compact` compresses the session history; unavailable under the minimal
+  preset (bash + editor only).
+- `/thinking` toggles extended reasoning display; UI state only — **not
+  persisted**.
 - After startup, the TUI checks npm for a newer version in the background and
   shows a notification when one is available. The check follows the npm
   registry configuration (`NPM_CONFIG_REGISTRY` or `~/.npmrc`), so mirror

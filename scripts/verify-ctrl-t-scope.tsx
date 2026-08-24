@@ -1,11 +1,14 @@
 /**
  * Ctrl+T ownership regression.
  *
- * Loaded-context details use the one-shot `/context` command. Ctrl+T has one
- * stable meaning throughout the session: open the trajectory scene.
+ * Ctrl+T has one stable meaning throughout the session: open the trajectory
+ * scene. The startup loaded-context panel (visible only while the transcript
+ * is still empty) owns Ctrl+P instead: the key toggles the collapsed summary
+ * between the one-liner and the grouped details. The one-shot `/context`
+ * command stays available in both states.
  *
- * These checks pin both empty- and non-empty-transcript states so another
- * context-sensitive shortcut does not creep back in.
+ * These checks pin both empty- and non-empty-transcript states so a
+ * context-sensitive shortcut does not creep in the wrong direction.
  *
  * Run: node --import tsx/esm scripts/verify-ctrl-t-scope.tsx
  */
@@ -15,7 +18,7 @@ process.env.FORCE_COLOR = '3'
 // locale, none of which a runner is obliged to agree with.
 process.env.DSH_TUI_LANG = 'zh'
 
-const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render }, { Chat }, { QuestionStore }] =
+const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render }, { Chat }, { QuestionStore }, { settle }] =
   await Promise.all([
     import('node:stream'),
     import('react'),
@@ -23,6 +26,7 @@ const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render }, { Chat
     import('../src/ui.js'),
     import('../src/screens/Chat.js'),
     import('../src/dsh-adapter/questions.js'),
+    import('./lib/term-test.mjs'),
   ])
 const instances = (await import('../src/ink/instances.js')).default
 
@@ -145,13 +149,15 @@ function makeHarness(cols: number, rows: number) {
   }
   const stdin = new FakeStdin()
   const screen = (): string => {
-    // getLine() indexes the WHOLE buffer, scrollback included; the viewport
-    // starts at baseY. Reading from 0 after a frame taller than the terminal
-    // returns the PREVIOUS, larger frame's rows — which reads exactly like a
-    // repaint bug and is not one.
+    // Read the WHOLE buffer (scrollback + viewport), filtered of blank
+    // lines. Content-presence checks must see rows the anchored shrink
+    // repaint legitimately left to their scrollback copies (a frame that
+    // collapsed below the viewport anchors its tail at the bottom and the
+    // viewport's top region goes blank); a viewport-only read mistakes
+    // that correct presentation for a lost panel.
     const buffer = term.buffer.active
-    return Array.from({ length: rows }, (_, y) =>
-      (buffer.getLine(buffer.baseY + y)?.translateToString(true) ?? '').replace(/\s+$/, ''))
+    return Array.from({ length: buffer.length }, (_, y) =>
+      (buffer.getLine(y)?.translateToString(true) ?? '').replace(/\s+$/, ''))
       .filter(line => line !== '')
       .join('\n')
   }
@@ -182,11 +188,13 @@ async function mount(harness: ReturnType<typeof makeHarness>, channel: Record<st
 }
 
 const CTRL_T = '\x14'
+const CTRL_P = '\x10'
 const isScene = (text: string): boolean => /✦\s*轨迹/.test(text)
 const panelHeader = (text: string): string =>
   text.split('\n').find(line => line.includes('已加载上下文')) ?? ''
 
-// ── empty transcript: summary is informational; Ctrl+T still means trace ───
+// ── empty transcript: the panel is collapsed; Ctrl+P toggles it, Ctrl+T
+//    still opens the trajectory ────────────────────────────────────────────
 {
   const harness = makeHarness(100, 30)
   const localReports: Array<{ title: string; lines: readonly string[] }> = []
@@ -194,24 +202,36 @@ const panelHeader = (text: string): string =>
     rows: [],
     pushLocal: (title: string, lines: readonly string[]) => { localReports.push({ title, lines }) },
   }))
-  await sleep(500)
+  await settle(() => /已加载上下文/.test(harness.screen()))
 
   const summary = harness.screen()
-  check('the startup context summary is on screen', /已加载上下文/.test(summary))
-  check('the summary points to /context', panelHeader(summary).includes('/context'), panelHeader(summary).trim())
-  check('the summary does not claim Ctrl+T', !panelHeader(summary).includes('Ctrl+T'), panelHeader(summary).trim())
+  check('the startup context panel is on screen', /已加载上下文/.test(summary))
+  check('the collapsed panel claims Ctrl+P', panelHeader(summary).includes('Ctrl+P'), panelHeader(summary).trim())
+
+  harness.stdin.write(CTRL_P)
+  await settle(() => harness.screen().includes('你是 dsh'))
+  const expanded = harness.screen()
+  check('Ctrl+P expands the panel before the first message', expanded.includes('你是 dsh'),
+    expanded.split('\n')[0]?.trim() ?? '')
+  check('the expanded details still point to /context', expanded.includes('/context'),
+    expanded.split('\n').filter(line => line.includes('/context')).join(' | '))
+
+  harness.stdin.write(CTRL_P)
+  await settle(() => !harness.screen().includes('你是 dsh'))
+  check('Ctrl+P collapses the panel again', !harness.screen().includes('你是 dsh'),
+    panelHeader(harness.screen()).trim())
 
   harness.stdin.write(CTRL_T)
-  await sleep(500)
+  await settle(() => isScene(harness.screen()))
   check('Ctrl+T opens the trajectory even before the first message', isScene(harness.screen()),
     harness.screen().split('\n')[0]?.trim())
 
   harness.stdin.write('q')
-  await sleep(400)
+  await settle(() => /已加载上下文/.test(harness.screen()))
   check('q returns to the context summary', /已加载上下文/.test(harness.screen()))
 
   harness.stdin.write('/context\r')
-  await sleep(400)
+  await settle(() => localReports.at(-1)?.title === '/context')
   const report = localReports.at(-1)
   check('/context emits one local report', report?.title === '/context')
   check('the report contains loaded-context details',
@@ -230,17 +250,19 @@ const panelHeader = (text: string): string =>
     harness,
     makeChannel({ rows: [{ id: 1, kind: 'user', text: '第一条消息' }] }),
   )
+  // 稳定性探针（面板不得出现）：条件从挂载起就成立，轮询会立即返回，
+  // 测不到「不再出现」——保留固定窗口。
   await sleep(500)
 
   const before = harness.screen()
   check('the startup panel is gone once a row exists', !/已加载上下文/.test(before))
 
   harness.stdin.write(CTRL_T)
-  await sleep(500)
+  await settle(() => isScene(harness.screen()))
   check('Ctrl+T opens the trajectory scene', isScene(harness.screen()), harness.screen().split('\n')[0]?.trim())
 
   harness.stdin.write('q')
-  await sleep(400)
+  await settle(() => !isScene(harness.screen()))
   check('q returns to the conversation', !isScene(harness.screen()))
 
   instance.unmount()

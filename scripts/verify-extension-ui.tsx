@@ -35,14 +35,15 @@ const [
   { render },
   { Chat },
   { QuestionStore },
-  { TuiDialogStore, TuiDialogRuntime, INPUT_CELLS },
-  { TuiStatusStore, TuiStatusRuntime },
-  { TuiShortcutRuntime, parseShortcutCombo, matchShortcut },
-  { TuiRendererRuntime },
+  { TuiDialogStore, TuiDialogRuntime, getHostDialogStore, INPUT_CELLS },
+  { TuiStatusStore, TuiStatusRuntime, getHostStatusStore },
+  { TuiShortcutRuntime, getHostShortcuts, parseShortcutCombo, matchShortcut },
+  { TuiRendererRuntime, getHostRenderers },
   { parseExtensionGrants },
   { dispatchTuiDecision, normalizeCancelDecision },
   { stringWidth },
   { KNOWN_SESSION_EVENT_TYPES },
+  { settle },
 ] = await Promise.all([
   import('node:stream'),
   import('react'),
@@ -58,6 +59,7 @@ const [
   import('../src/dsh-adapter/extension-events.js'),
   import('../src/ink/stringWidth.js'),
   import('@deepseek-ai/dsh-session'),
+  import('./lib/term-test.mjs'),
 ])
 const { mountAdmitted, testManifest, DECISION_COORDINATE } = await import('./plugin-test-utils.js')
 const pluginHostRow = await import('../src/dsh-adapter/plugin-host.js')
@@ -224,23 +226,65 @@ ctx.plugin(TuiShortcutRuntime)
 ctx.plugin(TuiRendererRuntime)
 await sleep(100)
 
+// Plugin-facing extension calls must originate from a live child activation.
+// Calling these services through the composition root would bind effects to
+// the host lifetime and is intentionally rejected by the runtime.
+let pluginCtx: Context | undefined
+const pluginFiber = ctx.plugin({
+  name: 'ui-extension-probe',
+  inject: ['tuiDialogs', 'tuiStatus', 'tuiShortcuts', 'tuiRenderers'],
+  apply: (candidate: Context) => {
+    pluginCtx = candidate
+  },
+})
+await sleep(50)
+if (pluginCtx === undefined) {
+  await Promise.resolve(pluginFiber.dispose())
+  throw new Error('UI extension probe did not start')
+}
+
+const dialogStore = getHostDialogStore(ctx.tuiDialogs)
+const statusStore = getHostStatusStore(ctx.tuiStatus)
+const shortcutHost = getHostShortcuts(ctx.tuiShortcuts)
+const rendererHost = getHostRenderers(ctx.tuiRenderers)
+if (dialogStore === undefined || statusStore === undefined || shortcutHost === undefined || rendererHost === undefined) {
+  throw new Error('extension host accessors were not initialized')
+}
+
+// Cordis callers receive a traceable service proxy. Host controls must stay
+// absent from that plugin-visible object: direct queue/store/dispatch access
+// would let one extension interfere with another extension's effects.
+check('host-only: dialog queue is absent from the plugin service',
+  !('store' in (ctx.tuiDialogs as object)))
+check('host-only: status store is absent from the plugin service',
+  !('store' in (ctx.tuiStatus as object)))
+check('host-only: shortcut dispatch is absent from the plugin service',
+  !('dispatch' in (ctx.tuiShortcuts as object)) && !('onError' in (ctx.tuiShortcuts as object)))
+check('host-only: renderer dispatch is absent from the plugin service',
+  !('render' in (ctx.tuiRenderers as object)))
+const publicExtensionSurface = await import('../src/extensions.js')
+check('host-only: accessors are absent from the public extension package',
+  !Object.keys(publicExtensionSurface).some(name => name.startsWith('getHost')))
+
+const plugin = pluginCtx
+
 {
   // Malformed requests resolve cancelled + warn; they never throw.
   check('tuiDialogs.select: no options → cancelled + warn',
-    (await ctx.tuiDialogs.select({ title: '空选择', options: [] })) === undefined && warnCount('tuiDialogs.select') === 1)
+    (await plugin.tuiDialogs.select({ title: '空选择', options: [] })) === undefined && warnCount('tuiDialogs.select') === 1)
   check('tuiDialogs.confirm: no title → false + warn',
-    (await ctx.tuiDialogs.confirm({ title: '' })) === false)
+    (await plugin.tuiDialogs.confirm({ title: '' })) === false)
   check('tuiDialogs.input: no title → cancelled',
-    (await ctx.tuiDialogs.input({ title: '   ' })) === undefined)
+    (await plugin.tuiDialogs.input({ title: '   ' })) === undefined)
 
   // Scalar-only coercion: a non-scalar title is REFUSED (warn + cancelled),
   // never coerced to "[object Object]" onto the screen.
   check('tuiDialogs.confirm: object title refused, not coerced',
-    (await ctx.tuiDialogs.confirm({ title: { nope: true } as unknown as string })) === false
+    (await plugin.tuiDialogs.confirm({ title: { nope: true } as unknown as string })) === false
     && warnCount('tuiDialogs.confirm called without a title') === 2)
 
   // Sanitization: control chars stripped, malformed options dropped.
-  const pending = ctx.tuiDialogs.select({
+  const pending = plugin.tuiDialogs.select({
     title: '带\x07铃声\n的标题',
     options: [
       { id: 'ok', label: '正常' },
@@ -249,7 +293,7 @@ await sleep(100)
     ],
     timeoutMs: 150,
   })
-  const snapshot = ctx.tuiDialogs.store.getSnapshot()
+  const snapshot = dialogStore.getSnapshot()
   check('tuiDialogs.select: control chars stripped from the title',
     snapshot?.kind === 'select' && snapshot.title === '带 铃声 的标题', JSON.stringify(snapshot?.title))
   check('tuiDialogs.select: malformed options filtered',
@@ -261,7 +305,7 @@ await sleep(100)
   // resolves with the exact string the plugin registered.
   const opaqueId = '  spaced id\t带 空白  '
   const longId = 'x'.repeat(300)
-  const pick = ctx.tuiDialogs.select({
+  const pick = plugin.tuiDialogs.select({
     title: ' opaque ids ',
     options: [
       { id: opaqueId, label: '空白 id' },
@@ -269,82 +313,82 @@ await sleep(100)
     ],
     timeoutMs: 200,
   })
-  const opaqueSnapshot = ctx.tuiDialogs.store.getSnapshot()
+  const opaqueSnapshot = dialogStore.getSnapshot()
   check('tuiDialogs.select: option ids kept verbatim in the snapshot',
     opaqueSnapshot?.kind === 'select'
     && opaqueSnapshot.options[0]?.id === opaqueId
     && opaqueSnapshot.options[1]?.id === longId)
-  ctx.tuiDialogs.store.cancel(ctx.tuiDialogs.store.getSnapshot()?.key ?? '')
+  dialogStore.cancel(dialogStore.getSnapshot()?.key ?? '')
   check('tuiDialogs.select: cleanup cancel still resolves undefined', (await pick) === undefined)
 }
 
 {
-  ctx.tuiStatus.set('Bad Key!', 'nope')
-  check('tuiStatus: invalid key refused + warn', ctx.tuiStatus.store.getSnapshot().length === 0 && warnCount('tuiStatus.set rejected invalid key') === 1)
+  plugin.tuiStatus.set('Bad Key!', 'nope')
+  check('tuiStatus: invalid key refused + warn', statusStore.getSnapshot().length === 0 && warnCount('tuiStatus.set rejected an invalid key') === 1)
   // P2-9：文档的 plugin:sub-item 冒号命名约定合法（逐段 slug 校验）。
-  ctx.tuiStatus.set('my-plugin:sub-item', 'colon ok')
+  plugin.tuiStatus.set('my-plugin:sub-item', 'colon ok')
   check('tuiStatus: colon-namespaced key accepted (documented convention)',
-    ctx.tuiStatus.store.getSnapshot().some(e => e.key === 'my-plugin:sub-item' && e.text === 'colon ok'))
-  ctx.tuiStatus.set('my-plugin:sub-item', undefined)
+    statusStore.getSnapshot().some(e => e.key === 'my-plugin:sub-item' && e.text === 'colon ok'))
+  plugin.tuiStatus.set('my-plugin:sub-item', undefined)
   // 大写按既有 case-fold 纪律归一为小写后接受。
-  ctx.tuiStatus.set('My-Plugin:Sub-Item', 'folded')
+  plugin.tuiStatus.set('My-Plugin:Sub-Item', 'folded')
   check('tuiStatus: uppercase colon key case-folds and is accepted',
-    ctx.tuiStatus.store.getSnapshot().some(e => e.key === 'my-plugin:sub-item' && e.text === 'folded'))
-  ctx.tuiStatus.set('My-Plugin:Sub-Item', undefined)
+    statusStore.getSnapshot().some(e => e.key === 'my-plugin:sub-item' && e.text === 'folded'))
+  plugin.tuiStatus.set('My-Plugin:Sub-Item', undefined)
   // 归一化后仍畸形的（空段/连冒号/空格）拒绝。
   for (const bad of ['trail:', ':lead', 'double::colon', 'has space:x']) {
-    const before = warnCount('tuiStatus.set rejected invalid key')
-    ctx.tuiStatus.set(bad, 'nope')
-    check(`tuiStatus: malformed colon key "${bad}" refused`, warnCount('tuiStatus.set rejected invalid key') === before + 1)
+    const before = warnCount('tuiStatus.set rejected an invalid key')
+    plugin.tuiStatus.set(bad, 'nope')
+    check(`tuiStatus: malformed colon key "${bad}" refused`, warnCount('tuiStatus.set rejected an invalid key') === before + 1)
   }
-  ctx.tuiStatus.set('demo', '构建\x1b[31m中')
+  plugin.tuiStatus.set('demo', '构建\x1b[31m中')
   check('tuiStatus: control chars stripped',
-    ctx.tuiStatus.store.getSnapshot()[0]?.text === '构建 [31m中', JSON.stringify(ctx.tuiStatus.store.getSnapshot()[0]?.text))
+    statusStore.getSnapshot()[0]?.text === '构建 [31m中', JSON.stringify(statusStore.getSnapshot()[0]?.text))
   // Scalar-only coercion: a non-scalar text is refused with a warn — never
   // rendered as "[object Object]", and NOT treated as a clear either.
-  ctx.tuiStatus.set('scalar', { nope: true } as unknown as string)
+  plugin.tuiStatus.set('scalar', { nope: true } as unknown as string)
   check('tuiStatus: non-scalar text refused + warn',
-    !ctx.tuiStatus.store.getSnapshot().some(e => e.key === 'scalar')
+    !statusStore.getSnapshot().some(e => e.key === 'scalar')
     && warnCount('tuiStatus.set rejected non-scalar text') === 1)
   // …but a number/boolean coerces (genuine scalars, not objects) — and the
   // public signature accepts them directly, no cast needed.
-  ctx.tuiStatus.set('scalar', 42)
+  plugin.tuiStatus.set('scalar', 42)
   check('tuiStatus: numeric text coerces',
-    ctx.tuiStatus.store.getSnapshot().find(e => e.key === 'scalar')?.text === '42')
-  ctx.tuiStatus.set('scalar', undefined)
+    statusStore.getSnapshot().find(e => e.key === 'scalar')?.text === '42')
+  plugin.tuiStatus.set('scalar', undefined)
   // Beyond MAX_ENTRIES (20): the 21st NEW key is refused.
-  for (let i = 0; i < 19; i++) ctx.tuiStatus.set(`plug-${String(i).padStart(2, '0')}`, 'x')
-  ctx.tuiStatus.set('one-too-many', 'x')
+  for (let i = 0; i < 19; i++) plugin.tuiStatus.set(`plug-${String(i).padStart(2, '0')}`, 'x')
+  plugin.tuiStatus.set('one-too-many', 'x')
   check('tuiStatus: contribution cap enforced',
-    ctx.tuiStatus.store.getSnapshot().length === 20 && warnCount('contributions already shown') === 1)
-  ctx.tuiStatus.set('demo', undefined)
-  for (let i = 0; i < 19; i++) ctx.tuiStatus.set(`plug-${String(i).padStart(2, '0')}`, undefined)
+    statusStore.getSnapshot().length === 20 && warnCount('contributions already shown') === 1)
+  plugin.tuiStatus.set('demo', undefined)
+  for (let i = 0; i < 19; i++) plugin.tuiStatus.set(`plug-${String(i).padStart(2, '0')}`, undefined)
 
   // Lifecycle disposer: clears only while the key still holds THIS text —
   // a stale disposer must not wipe a newer contribution.
-  const disposeOld = ctx.tuiStatus.set('lifecycle', '旧值')
+  const disposeOld = plugin.tuiStatus.set('lifecycle', '旧值')
   disposeOld()
   check('tuiStatus: disposer clears its own contribution',
-    ctx.tuiStatus.store.getSnapshot().length === 0)
-  const disposeStale = ctx.tuiStatus.set('lifecycle', '旧值')
-  ctx.tuiStatus.set('lifecycle', '新值')
+    statusStore.getSnapshot().length === 0)
+  const disposeStale = plugin.tuiStatus.set('lifecycle', '旧值')
+  plugin.tuiStatus.set('lifecycle', '新值')
   disposeStale()
   check('tuiStatus: stale disposer keeps the newer value',
-    ctx.tuiStatus.store.getSnapshot()[0]?.text === '新值')
-  ctx.tuiStatus.set('lifecycle', undefined)
-  check('tuiStatus: explicit clear still works', ctx.tuiStatus.store.getSnapshot().length === 0)
+    statusStore.getSnapshot()[0]?.text === '新值')
+  plugin.tuiStatus.set('lifecycle', undefined)
+  check('tuiStatus: explicit clear still works', statusStore.getSnapshot().length === 0)
 
   // Same-value ABA: two writes of IDENTICAL text — the first disposer must
   // not clear the second write (token comparison, not value comparison; a
   // hot reload restoring the same line hits exactly this).
-  const disposeFirst = ctx.tuiStatus.set('aba', '同值')
-  const disposeSecond = ctx.tuiStatus.set('aba', '同值')
+  const disposeFirst = plugin.tuiStatus.set('aba', '同值')
+  const disposeSecond = plugin.tuiStatus.set('aba', '同值')
   disposeFirst()
   check('tuiStatus: same-value stale disposer keeps the newer write',
-    ctx.tuiStatus.store.getSnapshot().some(e => e.key === 'aba' && e.text === '同值'))
+    statusStore.getSnapshot().some(e => e.key === 'aba' && e.text === '同值'))
   disposeSecond()
   check('tuiStatus: the owning disposer clears the same-value write',
-    !ctx.tuiStatus.store.getSnapshot().some(e => e.key === 'aba'))
+    !statusStore.getSnapshot().some(e => e.key === 'aba'))
 }
 
 {
@@ -390,131 +434,131 @@ await sleep(100)
 
   // registration rules
   const noop = () => {}
-  ctx.tuiShortcuts.register('ctrl+c', { description: 'x', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+c', { description: 'x', handler: noop })
   check('tuiShortcuts: reserved combo refused + warn',
-    ctx.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 1)
+    plugin.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 1)
   // Chat binds ctrl+o/ctrl+l/ctrl+e globally — they must be reserved too,
   // or a plugin would silently never fire (locals win at dispatch).
-  ctx.tuiShortcuts.register('ctrl+o', { description: 'x', handler: noop })
-  ctx.tuiShortcuts.register('alt+up', { description: 'x', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+o', { description: 'x', handler: noop })
+  plugin.tuiShortcuts.register('alt+up', { description: 'x', handler: noop })
   check('tuiShortcuts: chat-global combos reserved (ctrl+o, alt+up)',
-    ctx.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 3)
+    plugin.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 3)
   // ctrl+shift+enter is the editor's Shift+Enter newline (CSI 13;6u).
-  ctx.tuiShortcuts.register('ctrl+shift+enter', { description: 'x', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+shift+enter', { description: 'x', handler: noop })
   check('tuiShortcuts: editor newline combo reserved (ctrl+shift+enter)',
-    ctx.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 4)
-  // Built-ins match a modifier SUBSET (isMod && char, Shift never excluded):
+    plugin.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 4)
+  // Built-ins match a modifier SUBSET (ctrl && char, Shift never excluded):
   // a shift-superset of a reserved combo collides with the built-in on
   // terminals that don't report Shift distinctly — refused too.
-  ctx.tuiShortcuts.register('ctrl+shift+x', { description: 'x', handler: noop })
-  ctx.tuiShortcuts.register('ctrl+shift+t', { description: 'x', handler: noop })
-  check('tuiShortcuts: shift-supersets of reserved combos refused (ctrl+shift+x/t)',
-    ctx.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 6)
+  plugin.tuiShortcuts.register('ctrl+shift+g', { description: 'x', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+shift+t', { description: 'x', handler: noop })
+  check('tuiShortcuts: shift-supersets of reserved combos refused (ctrl+shift+g/t)',
+    plugin.tuiShortcuts.list().length === 0 && warnCount('reserved by a built-in binding') === 6)
   // …but a shift-superset of a NON-reserved combo still registers (and its
   // disposer removes it, keeping the registry empty for later sections).
-  const disposeShiftG = ctx.tuiShortcuts.register('ctrl+shift+g', { description: 'ok', handler: noop })
+  const disposeShiftX = plugin.tuiShortcuts.register('ctrl+shift+x', { description: 'ok', handler: noop })
   check('tuiShortcuts: shift-superset of a free combo registers',
-    ctx.tuiShortcuts.list().length === 1)
-  disposeShiftG()
+    plugin.tuiShortcuts.list().length === 1)
+  disposeShiftX()
   check('tuiShortcuts: the shift-superset disposes cleanly',
-    ctx.tuiShortcuts.list().length === 0)
-  ctx.tuiShortcuts.register('alt+escape', { description: 'x', handler: noop })
+    plugin.tuiShortcuts.list().length === 0)
+  plugin.tuiShortcuts.register('alt+escape', { description: 'x', handler: noop })
   check('tuiShortcuts: alt+escape refused at registration',
-    ctx.tuiShortcuts.list().length === 0 && warnCount('need ctrl/alt plus one key') === 1)
-  ctx.tuiShortcuts.register('not-a-combo', { description: 'x', handler: noop })
+    plugin.tuiShortcuts.list().length === 0 && warnCount('need ctrl/alt plus one key') === 1)
+  plugin.tuiShortcuts.register('not-a-combo', { description: 'x', handler: noop })
   check('tuiShortcuts: malformed combo refused', warnCount('need ctrl/alt plus one key') === 2)
-  ctx.tuiShortcuts.register('ctrl+g', { description: 'first', handler: noop })
-  ctx.tuiShortcuts.register('ctrl+g', { description: 'second', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+b', { description: 'first', handler: noop })
+  plugin.tuiShortcuts.register('ctrl+b', { description: 'second', handler: noop })
   check('tuiShortcuts: duplicate refused',
-    ctx.tuiShortcuts.list().length === 1 && warnCount('already registered') === 1)
-  ctx.tuiShortcuts.register('ctrl+h', { description: '  ', handler: noop })
-  check('tuiShortcuts: empty description refused', ctx.tuiShortcuts.list().length === 1)
+    plugin.tuiShortcuts.list().length === 1 && warnCount('already registered') === 1)
+  plugin.tuiShortcuts.register('ctrl+h', { description: '  ', handler: noop })
+  check('tuiShortcuts: empty description refused', plugin.tuiShortcuts.list().length === 1)
 
   // dispatch: hit runs the handler and consumes; miss passes through.
   let fired = 0
-  ctx.tuiShortcuts.register('alt+z', { description: 'fire', handler: () => { fired += 1 } })
-  check('tuiShortcuts.dispatch: matching key consumed', ctx.tuiShortcuts.dispatch('z', { meta: true }) === true)
-  await sleep(20)
+  plugin.tuiShortcuts.register('alt+z', { description: 'fire', handler: () => { fired += 1 } })
+  check('tuiShortcuts.dispatch: matching key consumed', shortcutHost.dispatch('z', { meta: true }) === true)
+  await settle(() => fired === 1)
   check('tuiShortcuts.dispatch: handler ran', fired === 1)
-  check('tuiShortcuts.dispatch: non-matching key passes through', ctx.tuiShortcuts.dispatch('q', { ctrl: true }) === false)
+  check('tuiShortcuts.dispatch: non-matching key passes through', shortcutHost.dispatch('q', { ctrl: true }) === false)
 
   // Throwing handler → onError, never propagated.
   let errored = ''
-  ctx.tuiShortcuts.onError = combo => { errored = combo }
-  ctx.tuiShortcuts.register('alt+y', {
+  const removeErrorHandler = shortcutHost.setErrorHandler(combo => { errored = combo })
+  plugin.tuiShortcuts.register('alt+y', {
     description: 'boom',
     handler: () => { throw new Error('handler exploded') },
   })
-  ctx.tuiShortcuts.dispatch('y', { meta: true })
-  await sleep(20)
+  shortcutHost.dispatch('y', { meta: true })
+  await settle(() => errored === 'alt+y')
   check('tuiShortcuts.dispatch: handler error routed to onError', errored === 'alt+y')
-  ctx.tuiShortcuts.onError = undefined
+  removeErrorHandler()
 
   // dispose unregisters
-  const dispose = ctx.tuiShortcuts.register('alt+x', { description: 'temp', handler: noop })
+  const dispose = plugin.tuiShortcuts.register('alt+x', { description: 'temp', handler: noop })
   dispose()
-  check('tuiShortcuts: dispose unregisters', ctx.tuiShortcuts.dispatch('x', { meta: true }) === false)
+  check('tuiShortcuts: dispose unregisters', shortcutHost.dispatch('x', { meta: true }) === false)
 }
 
 {
   const noop = () => undefined
-  ctx.tuiRenderers.register('user/message', noop)
+  plugin.tuiRenderers.register('user/message', noop)
   check('tuiRenderers: built-in event type refused', warnCount('built-in event types keep their own projection') === 1)
-  ctx.tuiRenderers.register('agent-preset/selected', noop)
+  plugin.tuiRenderers.register('agent-preset/selected', noop)
   check('tuiRenderers: host-special plugin event refused', warnCount('built-in event types keep their own projection') === 2)
-  ctx.tuiRenderers.register('NoSlash', noop)
-  check('tuiRenderers: malformed type refused', warnCount('rejected invalid event type') === 1)
+  plugin.tuiRenderers.register('NoSlash', noop)
+  check('tuiRenderers: malformed type refused', warnCount('rejected an invalid event type') === 1)
   const dupBefore = warnCount('already registered')
-  ctx.tuiRenderers.register('my-plugin/note', () => ({ title: '便签', lines: ['第一行', '第二行'] }))
-  ctx.tuiRenderers.register('my-plugin/note', noop)
+  plugin.tuiRenderers.register('my-plugin/note', () => ({ title: '便签', lines: ['第一行', '第二行'] }))
+  plugin.tuiRenderers.register('my-plugin/note', noop)
   check('tuiRenderers: duplicate refused', warnCount('already registered') === dupBefore + 1)
-  const result = ctx.tuiRenderers.render('my-plugin/note', { text: 'x' })
+  const result = rendererHost.render('my-plugin/note', { text: 'x' })
   check('tuiRenderers.render: title + lines returned',
     result?.title === '便签' && result.lines.length === 2)
   check('tuiRenderers.render: unregistered type → undefined',
-    ctx.tuiRenderers.render('other/thing', {}) === undefined)
+    rendererHost.render('other/thing', {}) === undefined)
 
   // The built-in denylist is a module-load SNAPSHOT: a plugin that followed
   // seam 1's rule (adding its type to the live KNOWN_SESSION_EVENT_TYPES
   // before persisting events) must still be able to register a renderer for
   // that type — the mutable set must not become a self-denial.
   KNOWN_SESSION_EVENT_TYPES.add('my-plugin/persisted')
-  ctx.tuiRenderers.register('my-plugin/persisted', () => ({ lines: ['已登记'] }))
+  plugin.tuiRenderers.register('my-plugin/persisted', () => ({ lines: ['已登记'] }))
   check('tuiRenderers: renderer for a plugin-REGISTERED type is accepted',
-    ctx.tuiRenderers.render('my-plugin/persisted', {})?.lines.length === 1)
+    rendererHost.render('my-plugin/persisted', {})?.lines.length === 1)
   KNOWN_SESSION_EVENT_TYPES.delete('my-plugin/persisted')
 
   // Output validation inside the render boundary: non-string title dropped
   // (it would crash React), lines capped, control chars stripped, non-scalar
   // lines skipped.
-  ctx.tuiRenderers.register('big/output', () => ({
+  plugin.tuiRenderers.register('big/output', () => ({
     title: 42 as never,
     lines: Array.from({ length: 5000 }, (_, i) => `行${i}\x07尾部`),
   }))
-  const big = ctx.tuiRenderers.render('big/output', {})
+  const big = rendererHost.render('big/output', {})
   check('tuiRenderers.render: non-string title dropped, no crash', big?.title === undefined)
   check('tuiRenderers.render: lines capped at 100', big?.lines.length === 100, String(big?.lines.length))
   check('tuiRenderers.render: control chars stripped from lines',
     big !== undefined && !big.lines.some(line => line.includes('\x07')))
-  ctx.tuiRenderers.register('mixed/lines', () => ({
+  plugin.tuiRenderers.register('mixed/lines', () => ({
     lines: ['文本', 42, true, null, { bad: true }, '末尾'] as never,
   }))
-  const mixed = ctx.tuiRenderers.render('mixed/lines', {})
+  const mixed = rendererHost.render('mixed/lines', {})
   check('tuiRenderers.render: scalar lines coerced, objects skipped',
     mixed?.lines.join('|') === '文本|42|true|末尾', JSON.stringify(mixed?.lines))
 
   // Throwing renderer: skipped, sticky-logged once per type.
   const before = warnCount('renderer for "bad/actor" threw')
-  ctx.tuiRenderers.register('bad/actor', () => { throw new Error('render exploded') })
-  ctx.tuiRenderers.render('bad/actor', {})
-  ctx.tuiRenderers.render('bad/actor', {})
+  plugin.tuiRenderers.register('bad/actor', () => { throw new Error('render exploded') })
+  rendererHost.render('bad/actor', {})
+  rendererHost.render('bad/actor', {})
   check('tuiRenderers.render: throw → undefined, logged once per type',
-    ctx.tuiRenderers.render('bad/actor', {}) === undefined && warnCount('renderer for "bad/actor" threw') === before + 1)
+    rendererHost.render('bad/actor', {}) === undefined && warnCount('renderer for "bad/actor" threw') === before + 1)
 
   // Malformed result (lines not an array) → no opinion.
-  ctx.tuiRenderers.register('weird/result', () => ({ title: 'x' }) as never)
+  plugin.tuiRenderers.register('weird/result', () => ({ title: 'x' }) as never)
   check('tuiRenderers.render: malformed result → undefined',
-    ctx.tuiRenderers.render('weird/result', {}) === undefined)
+    rendererHost.render('weird/result', {}) === undefined)
 }
 
 // ── B2. RFC 0005 D-7: intercept subscriptions require explicit grants ────
@@ -582,7 +626,7 @@ await sleep(100)
     { order: 'ui-observe' },
   )
   await dispatchTuiDecision(guardCtx, 'tui/session-switched', { sessionId: 'ui-session' }, () => undefined)
-  await sleep(20)
+  await settle(() => observed && !guardWarnings.some(line => line.includes('tui/session-switched')))
   check('decision guard: observe-class events stay ungated',
     observed && !guardWarnings.some(line => line.includes('tui/session-switched')))
   observeRelease()
@@ -642,9 +686,9 @@ const instance = await render(
     channel={channel as never}
     questionStore={new QuestionStore()}
     onExit={() => {}}
-    extensionDialogs={ctx.tuiDialogs.store}
-    extensionStatus={ctx.tuiStatus.store}
-    extensionShortcuts={ctx.tuiShortcuts}
+    extensionDialogs={dialogStore}
+    extensionStatus={statusStore}
+    extensionShortcuts={shortcutHost}
   />,
   { stdout, stdin, stderr: new FakeStderr(), exitOnCtrlC: false, patchConsole: false },
 )
@@ -653,35 +697,35 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 
 // Select: ↓ + Enter picks the second option.
 {
-  const pending = ctx.tuiDialogs.select({
+  const pending = plugin.tuiDialogs.select({
     title: '挑一个',
     options: [
       { id: 'first', label: '第一项' },
       { id: 'second', label: '第二项', description: '带描述' },
     ],
   })
-  await sleep(300)
+  await settle(() => screen().includes('挑一个') && screen().includes('第二项'))
   check('ui: select dialog renders title + options',
     screen().includes('挑一个') && screen().includes('第二项'), screen().slice(-200))
   stdin.write('\x1b[B')
   await sleep(150)
   stdin.write('\r')
   check('ui: select ↓+Enter resolves the second id', (await pending) === 'second')
-  await sleep(200)
-  check('ui: dialog closed after settle', ctx.tuiDialogs.store.getSnapshot() === null)
+  await settle(() => dialogStore.getSnapshot() === null)
+  check('ui: dialog closed after settle', dialogStore.getSnapshot() === null)
 }
 
 // FIFO: the second dialog waits for the first to settle. Confirm: Enter = yes.
 {
-  const first = ctx.tuiDialogs.confirm({ title: '确认一下', message: '要做吗' })
-  const second = ctx.tuiDialogs.select({ title: '排队的选择', options: [{ id: 'only', label: '唯一' }] })
-  await sleep(300)
+  const first = plugin.tuiDialogs.confirm({ title: '确认一下', message: '要做吗' })
+  const second = plugin.tuiDialogs.select({ title: '排队的选择', options: [{ id: 'only', label: '唯一' }] })
+  await settle(() => screen().includes('确认一下') && screen().includes('要做吗'))
   check('ui: confirm renders with message + localized defaults',
     screen().includes('确认一下') && screen().includes('要做吗'), screen().slice(-200))
-  check('ui: FIFO — second dialog still queued', ctx.tuiDialogs.store.getSnapshot()?.kind === 'confirm')
+  check('ui: FIFO — second dialog still queued', dialogStore.getSnapshot()?.kind === 'confirm')
   stdin.write('\r') // Enter on 是 → true
   check('ui: confirm Enter resolves true', (await first) === true)
-  await sleep(300)
+  await settle(() => screen().includes('排队的选择'))
   check('ui: queued select now active',
     screen().includes('排队的选择'), screen().slice(-200))
   stdin.write('\x1b') // Esc cancels the select
@@ -690,8 +734,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 
 // Input: placeholder shown when empty; typed text resolves.
 {
-  const pending = ctx.tuiDialogs.input({ title: '说点什么', placeholder: '占位提示', initial: '' })
-  await sleep(300)
+  const pending = plugin.tuiDialogs.input({ title: '说点什么', placeholder: '占位提示', initial: '' })
+  await settle(() => screen().includes('占位提示'))
   check('ui: input dialog renders placeholder', screen().includes('占位提示'), screen().slice(-200))
   for (const ch of '你好') { stdin.write(ch); await sleep(60) }
   stdin.write('\r')
@@ -700,8 +744,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 
 // Input with initial: pre-filled, edited, submitted.
 {
-  const pending = ctx.tuiDialogs.input({ title: '改改', initial: '原文' })
-  await sleep(300)
+  const pending = plugin.tuiDialogs.input({ title: '改改', initial: '原文' })
+  await settle(() => screen().includes('原文'))
   stdin.write('\x7f') // backspace removes 文
   await sleep(150)
   stdin.write('\r')
@@ -712,12 +756,14 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // press (isPasted lives on the InputEvent, not the key) — the confirm must
 // survive it, on its default Yes focus.
 {
-  const pending = ctx.tuiDialogs.confirm({ title: '粘贴确认' })
-  await sleep(300)
+  const pending = plugin.tuiDialogs.confirm({ title: '粘贴确认' })
+  await settle(() => screen().includes('粘贴确认'))
   stdin.write('\x1b[200~\r\n\r\n\x1b[201~')
+  // 稳定性探针（对话框不得被粘贴确认掉）：条件在粘贴前就成立，轮询会
+  // 立即返回，测不到「没被误触」——保留固定窗口。
   await sleep(250)
   check('ui: pure-newline paste does NOT confirm the dialog',
-    ctx.tuiDialogs.store.getSnapshot()?.kind === 'confirm')
+    dialogStore.getSnapshot()?.kind === 'confirm')
   stdin.write('\x1b') // cleanup: Esc cancels it
   const resolvedPasteConfirm = await pending
   check('ui: paste-surviving dialog cancels normally', resolvedPasteConfirm === false, JSON.stringify(resolvedPasteConfirm))
@@ -727,7 +773,9 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // flattened, and the whole value is capped at INPUT_CELLS cells so the
 // resolved answer keeps the documented ≤500-cell bound.
 {
-  const pending = ctx.tuiDialogs.input({ title: '粘贴输入', initial: '' })
+  const pending = plugin.tuiDialogs.input({ title: '粘贴输入', initial: '' })
+  // 排序等待：增量渲染只重绘变化单元格（标题与上一面板共享 '粘贴' 两格），
+  // 帧窗里凑不出完整标题可供 settle——保留固定窗口。
   await sleep(300)
   const chunk = '多行\n粘贴\x07' + '长'.repeat(600)
   stdin.write(`\x1b[200~${chunk}\x1b[201~`)
@@ -745,9 +793,12 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // INPUT_CELLS even without paste).
 {
   const nearCap = '字'.repeat(250) // 500 cells exactly (wide chars)
-  const pending = ctx.tuiDialogs.input({ title: '顶格输入', initial: nearCap })
+  const pending = plugin.tuiDialogs.input({ title: '顶格输入', initial: nearCap })
+  // 排序等待：同上，增量重绘下标题片段化，无可靠的屏幕观察点——保留。
   await sleep(300)
   stdin.write('x')
+  // 稳定性探针（超上限按键必须被忽略）：值不得变化，轮询等于没测——
+  // 保留固定窗口让误收的 x 有时间落地。
   await sleep(150)
   stdin.write('\r')
   check('ui: typing past the cell cap is ignored',
@@ -759,22 +810,22 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // event is invisible to the second. The handlers must act on synchronously
 // updated state (refs): ↓+Enter settles the NEW focus, not the stale one.
 {
-  const pending = ctx.tuiDialogs.select({
+  const pending = plugin.tuiDialogs.select({
     title: '同批选择',
     options: [
       { id: 'first', label: '第一项' },
       { id: 'second', label: '第二项' },
     ],
   })
-  await sleep(300)
+  await settle(() => screen().includes('同批选择'))
   stdin.write('\x1b[B\r') // Down + Enter in one chunk
   check('ui: batched ↓+Enter settles the NEW focus, not the stale one',
     (await pending) === 'second')
   await sleep(200)
 }
 {
-  const pending = ctx.tuiDialogs.confirm({ title: '同批确认' })
-  await sleep(300)
+  const pending = plugin.tuiDialogs.confirm({ title: '同批确认' })
+  await settle(() => screen().includes('同批确认'))
   stdin.write('\x1b[C\r') // Right + Enter in one chunk → focus 否 → false
   check('ui: batched →+Enter settles the moved focus', (await pending) === false)
   await sleep(200)
@@ -782,8 +833,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // Two Backspaces in one chunk must BOTH delete (each seeing the other's
 // result), not compute from the same stale base.
 {
-  const pending = ctx.tuiDialogs.input({ title: '同批退格', initial: 'abcd' })
-  await sleep(300)
+  const pending = plugin.tuiDialogs.input({ title: '同批退格', initial: 'abcd' })
+  await settle(() => screen().includes('同批退格'))
   stdin.write('\x7f\x7f')
   await sleep(150)
   stdin.write('\r')
@@ -794,7 +845,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // surrogate pair (never a lone half), and arrow keys never land the cursor
 // inside a pair.
 {
-  const pending = ctx.tuiDialogs.input({ title: '表情退格', initial: 'a😊b' })
+  const pending = plugin.tuiDialogs.input({ title: '表情退格', initial: 'a😊b' })
+  // 排序等待：同上，增量重绘下标题片段化，无可靠的屏幕观察点——保留。
   await sleep(300)
   stdin.write('\x1b[D') // left: cursor between 😊 and b
   await sleep(120)
@@ -805,7 +857,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
     (await pending) === 'ab')
 }
 {
-  const pending = ctx.tuiDialogs.input({ title: '表情清空', initial: '😊' })
+  const pending = plugin.tuiDialogs.input({ title: '表情清空', initial: '😊' })
+  // 排序等待：同上，增量重绘下标题片段化，无可靠的屏幕观察点——保留。
   await sleep(300)
   stdin.write('\x7f') // single backspace at end of the sole emoji
   await sleep(150)
@@ -813,7 +866,8 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
   check('ui: Backspace on the sole emoji empties the value', (await pending) === '')
 }
 {
-  const pending = ctx.tuiDialogs.input({ title: '表情步进', initial: '😊x' })
+  const pending = plugin.tuiDialogs.input({ title: '表情步进', initial: '😊x' })
+  // 排序等待：同上，增量重绘下标题片段化，无可靠的屏幕观察点——保留。
   await sleep(300)
   // Left ×2 from the end: code-point steps land BEFORE the emoji (a UTF-16
   // step would park the cursor mid-surrogate and split the pair on insert).
@@ -828,14 +882,16 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 
 // Status line: appears on set, disappears on clear.
 {
-  ctx.tuiStatus.set('demo-plugin', '构建中 42%')
-  await sleep(300)
+  plugin.tuiStatus.set('demo-plugin', '构建中 42%')
+  await settle(() => screen().includes('构建中 42%'))
   check('ui: status line renders the contribution', screen().includes('构建中 42%'), screen().slice(-300))
   // The incremental renderer only writes diffs: after the clear, assert on
   // frames written FROM the clear on — earlier frames legitimately still
   // contain the set text.
   const mark = stdout.frames.length
-  ctx.tuiStatus.set('demo-plugin', undefined)
+  plugin.tuiStatus.set('demo-plugin', undefined)
+  // 稳定性探针（清除后的重绘不得再含该文案）：mark 之后暂无新帧时条件
+  // 空洞成立，轮询会立即返回——保留固定窗口等待重绘发生。
   await sleep(300)
   check('ui: status line clears', !plainText(stdout.frames.slice(mark)).includes('构建中'))
 }
@@ -845,10 +901,10 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // by an earlier section (a duplicate registration would be refused).
 {
   let fired = 0
-  ctx.tuiShortcuts.register('alt+p', { description: 'ui fire', handler: () => { fired += 1 } })
+  plugin.tuiShortcuts.register('alt+p', { description: 'ui fire', handler: () => { fired += 1 } })
   await sleep(100)
   stdin.write('\x1bp') // alt+p
-  await sleep(300)
+  await settle(() => fired >= 1)
   check('ui: plugin shortcut handler fired through Chat', fired >= 1, String(fired))
   check('ui: shortcut keypress never reached submit', channel.submitCalls.length === 0)
 }
@@ -858,10 +914,12 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 // ctrl+j would arrive as \n and read as Enter.)
 {
   let fired = 0
-  ctx.tuiShortcuts.register('alt+b', { description: 'blocked', handler: () => { fired += 1 } })
-  const pending = ctx.tuiDialogs.confirm({ title: '占键盘中' })
-  await sleep(300)
+  plugin.tuiShortcuts.register('alt+b', { description: 'blocked', handler: () => { fired += 1 } })
+  const pending = plugin.tuiDialogs.confirm({ title: '占键盘中' })
+  await settle(() => screen().includes('占键盘中'))
   stdin.write('\x1bb') // alt+b — must not reach shortcuts while the dialog is open
+  // 稳定性探针（快捷键不得触发）：fired 本就为 0，轮询会立即返回，
+  // 测不到「没被触发」——保留固定窗口。
   await sleep(200)
   check('ui: open dialog gates plugin shortcuts', fired === 0)
   stdin.write('\x1b')
@@ -869,6 +927,10 @@ const screen = (back = 30) => plainText(stdout.frames.slice(-back))
 }
 
 await instance.unmount()
+await pluginFiber.dispose()
+check('lifecycle: plugin activation dispose leaves no status contribution', statusStore.getSnapshot().length === 0)
+check('lifecycle: plugin activation dispose leaves no shortcut', shortcutHost.dispatch('alt+p', { alt: true, meta: true, name: 'p' }) === false)
+check('lifecycle: plugin activation dispose leaves no renderer', rendererHost.render('my-plugin/persisted', {}) === undefined)
 
 if (failures > 0) {
   console.error(`${failures} check(s) failed`)

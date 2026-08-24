@@ -11,6 +11,12 @@
   <a href="https://github.com/ccch1mneyyy/dsh-TUI/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ccch1mneyyy/dsh-TUI/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-263146?style=flat-square"></a>
   <img alt="Public beta" src="https://img.shields.io/badge/status-public%20beta-7da1de?style=flat-square">
+  <a href="https://github.com/ccch1mneyyy/dsh-TUI/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/ccch1mneyyy/dsh-TUI?style=flat-square&color=4b6fff"></a>
+  <a href="https://www.npmjs.com/package/@deepseek-harness-tui/dsh-tui"><img alt="npm downloads" src="https://img.shields.io/npm/dm/@deepseek-harness-tui/dsh-tui?style=flat-square&color=4b6fff"></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/146168" title="GitHub Trending Daily #7 · TypeScript"><img alt="Trendshift" src="https://trendshift.io/api/badge/trendshift/repositories/146168/daily?language=TypeScript"></a>
 </p>
 
 # dsh-TUI
@@ -28,7 +34,7 @@ the interface, and removing it leaves no core modifications behind.
 > permission model or terminal-specific behavior.
 
 <p align="center">
-  <a href="https://dshfind.com/ccch1mneyyy/dsh-TUI"><img src="https://dshfind.com/api/card/ccch1mneyyy/dsh-TUI?lang=en" alt="dsh-TUI on dshfind"></a>
+  <a href="https://dshfind.com/en/plugins/ccch1mneyyy/dsh-TUI"><img src="https://dshfind.com/api/card/ccch1mneyyy/dsh-TUI?lang=en" alt="dsh-TUI on dshfind"></a>
 </p>
 
 ## Highlights
@@ -39,6 +45,13 @@ the interface, and removing it leaves no core modifications behind.
   sent as durable image blocks), history
   search, message selection, inline or alternate-screen rendering, and `/lang`
   zh/en UI language switching.
+- **Timeline navigation**: a Grok-style turn rail covering **every turn
+  (folded ones included)** — even when the fold window only exposes the last
+  few turns, the full history stays one click away (clicking a folded tick
+  reveals that turn and scrolls to it). When not pinned to the bottom,
+  `Enter`/`End` jump back in one step (no blank flash from long distances)
+  and a clickable new-messages pill stays in view; the right gutter offers
+  timeline / scrollbar / hidden modes.
 - **Visible agent state**: live activity, segmented context usage, TPS, cache
   hit rate, reasoning effort, input/output tokens, and Git/session metadata.
 - **Complete session workflow**: `/resume`, `/new`, `/workspace`, `/compact`, `/export`, the
@@ -49,7 +62,12 @@ the interface, and removing it leaves no core modifications behind.
   and registries.
 - **Designed for long sessions**: event-driven projection, differential output,
   message virtualization, replay coalescing, and bounded caches prevent render
-  cost and memory from growing without limit.
+  cost and memory from growing without limit; fingerprint-memoized hot paths
+  render with **zero per-frame allocations** (~200KB of GC churn saved every
+  16ms tick in a 3200-row session), wrapText and markdown tokens reuse global
+  LRU caches across mounts, the main screen paints in frames (fold window
+  300→120 rows), and long-session resume lands straight on content (splash
+  skipped, anchored to the newest message's last row).
 
 ## Preview
 
@@ -83,6 +101,30 @@ commands), then `dsh-tui` and `dsh --profile dsh-tui` are equivalent.
 `dsh-tui --resume` restores the most recently selected session; on Windows
 the repository's `dsh-tui.cmd` works the same way.
 
+CLI subcommands (`dsh-tui help` prints the full usage):
+
+| Command | Purpose |
+|---|---|
+| `dsh-tui update` | Update the profile to the latest release and align the launcher (same install logic as the in-TUI `/update`, without restarting into the TUI) |
+| `dsh-tui version` | Show the launcher and profile versions (`--version`/`-v` are equivalent) |
+| `dsh-tui help` | Show usage (`--help`/`-h` are equivalent) |
+
+`help`/`version` work even when dsh is missing or the profile is not initialized; `update` needs dsh (a missing dsh gets an install hint);
+every other argument is still forwarded verbatim to `dsh --profile dsh-tui`.
+The repository-root `dsh-tui.cmd` is a launch wrapper that goes straight to
+`dsh --profile` and carries no subcommands — subcommands belong to the
+npm-installed `dsh-tui` command.
+
+### Herdr
+
+Run `dsh-tui` directly in a [Herdr](https://herdr.dev) pane; no extra setup is
+required. dsh-TUI reports `idle`, `working`, and `blocked` through Herdr's local
+integration API and marks questionnaires and tool approvals as `blocked`. The
+integration is completely inactive outside Herdr. `herdr agent start --kind
+dsh-tui`, session identity, and automatic restoration after a Herdr server
+restart still require a native dsh-TUI agent kind upstream; manually launched
+panes already retain, reconnect, and expose their live state.
+
 For running dsh-TUI inside VS Code — directly in the integrated terminal or
 via the `dsh-tui-vscode` companion extension (real-integrated-terminal
 sessions, an experience almost identical to the official Claude Code
@@ -92,11 +134,23 @@ extension; available on the VS Code Marketplace) — see
 See [Getting started](docs/getting-started.en.md) for profile composition,
 source builds, and troubleshooting.
 
-Inside the TUI, `/update` updates the installed
-`@deepseek-harness-tui/dsh-tui` package and automatically restarts into the current session.
+The TUI checks the configured registry for newer versions in the background
+after startup (the check never blocks the first frame and silently ignores
+offline or registry errors). When an update is available, just type `/update`
+for a one-shot upgrade: it updates the runtime actually running in the current
+`dsh-tui` profile, verifies the install result, then restarts automatically and
+resumes the current session.
 
-The TUI also checks npm for updates in the background after startup. The check
-never blocks the first frame and silently ignores offline or registry errors.
+When launched through the global `dsh-tui` command, newer versions
+automatically migrate/align the global entry to a delegating launcher: the
+global command only forwards to the copy inside the profile, so the startup
+logic always follows the profile version.
+
+Under normal circumstances no extra manual step is needed:
+
+```sh
+npm install -g @deepseek-harness-tui/dsh-tui
+```
 
 For migration from the former `dsh-cc-tui` package and `cc-tui` profile, see
 [Getting started](docs/getting-started.en.md#migrate-from-the-former-package).
@@ -105,17 +159,28 @@ For migration from the former `dsh-cc-tui` package and `cc-tui` profile, see
 
 | Key | Action |
 |---|---|
-| `Enter` | Send (`Shift+Enter` for a newline); executes the selected item when a command menu is open |
+| `Enter` | Idle = send (`Shift+Enter` for a newline, or `Ctrl+J` when the terminal cannot report modified Enter; `Option+Enter` is the fallback on macOS Terminal.app, issue #110); **while the model is working = steer** (inject a next-step boundary without interrupting); executes the selected item when a command menu is open |
+| `Ctrl+Enter` (⌘Enter) | **Interrupt the current turn and send immediately** (interrupt) |
+| `Alt+Up` | Pull the last unhandled message back into the input for editing (without interrupting the turn) |
+| `Tab` | Complete `/` commands or `@` files (keep drilling into directories); **while the model is working = follow-up** (queued after the current turn) |
 | `Ctrl+C` | Interrupt the current turn; press twice while idle to exit |
 | `Esc` | Close the command/file menu; double-press while idle clears the input; **double-press on empty input = time rewind** |
 | `Ctrl+O` | Expand/collapse details (full thinking text, tool arguments and output) |
 | `Ctrl+R` | History search |
 | `/` | In-session full-text search (`n`/`N` to jump) |
-| `Tab` / `Enter` | Command / `@` file completion (keep drilling into directories) |
-| `Ctrl+V` | Paste text or files from the file manager; images show as `[Image #N]` and are sent as durable attachments |
-| `Ctrl+X` | Edit the current input with `$VISUAL`/`$EDITOR` (e.g. nvim); content is filled back in on save and exit |
-| `?` | Keybinding menu |
+| `Ctrl+V` / `Alt+V` | Paste text or files from the file manager; images show as `[Image #N]` and are sent as durable attachments. Use `Alt+V` when the terminal intercepts `Ctrl+V` |
+| `Ctrl+G` | Edit the current input with `$VISUAL`/`$EDITOR` (e.g. nvim); content is filled back in on save and exit |
+| `?` | Keybinding menu (responds only when the input is empty) |
 | `Shift+↑` | Message selection mode (`Enter` expands a single message) |
+| `Ctrl+P` | Toggle the startup loaded-context panel (effective while the panel is on screen) |
+| `Home` / `End`, `Ctrl+A` / `Ctrl+E` | Logical line start / end; `Ctrl+E` is dual-purpose: line end in the input, expand/collapse hidden older messages during transcription |
+| `Ctrl+←` / `Ctrl+→` (⌘←/→) | Jump by word |
+| `Ctrl+U` / `Ctrl+K` | Delete before the cursor (to line start) / after the cursor (to line end) |
+| `Ctrl+W` | Delete the previous word |
+
+**Three delivery modes while the model is working**: `Enter` = steer (inject a next-step boundary, no interruption) · `Tab` = follow-up (queued after the current turn) · `Ctrl+Enter` = interrupt (break in and send immediately).
+
+**Custom keybindings**: the action shortcuts above (paste, history search, external editor, transcript expand, trajectory, subagent dashboard, loaded-context panel, show-all, redraw, todo fold) are remappable in `/settings` → `dsh-tui` → `Shortcuts`: enter combos like `alt+v` or `ctrl+shift+v`, comma-separate several, leave blank to restore the default; saves apply live with no restart. Combos that clash with the fixed editing keys (`Ctrl+A/E/U/K/W`, `Ctrl+←/→`) or with another action are rejected. Deployments can also pin them statically via `shortcuts.<action>` in cordis.yml (the settings user layer wins).
 
 **macOS modifier keys**: the `Ctrl+<key>` bindings above also work with `⌘<key>`
 on macOS (e.g. `⌘V` paste, `⌘O` expand details, `⌘Enter` send immediately);
@@ -125,14 +190,20 @@ terminal support for the extended keyboard protocol (iTerm2 / kitty / WezTerm /
 ghostty / tmux); macOS's built-in Terminal.app consumes `⌘` shortcuts itself,
 so keep using `Ctrl`.
 
-**Mouse** (`fullscreen: true` fullscreen mode; off by default, enabled by the profile patch layer)
+**Mouse** (fullscreen is the factory default since 0.9.0; set `fullscreen: false` to restore the inline main screen; updating from an older version clears a previously saved inline choice once — you can still pick inline again afterwards)
 
 | Action | Function |
 |---|---|
 | Drag to select | In-app text selection, **copied on release** (OSC 52 with native `wl-copy`/`xclip`/`xsel` fallback; `load-buffer -w` inside tmux); the selection is cleared after copying and a "Copied N characters" notice pops up |
 | Double / triple click | Select word / line, copied on selection just the same |
-| Scroll wheel | Scroll the message list |
+| Scroll wheel | Only with fullscreen mouse tracking: scroll Help while it is open, otherwise scroll messages (±3 lines per notch); default inline mode does not deliver wheel events to the TUI |
+| Click a timeline-rail tick | Jump to that turn — the rail covers every turn (folded ones included); a folded tick reveals its turn first, then scrolls it into place |
 | `Esc` | Cancel an in-progress drag selection (no copy) |
+| Single-click a message line | Expand/collapse that line |
+| Click "load earlier messages" / "ctrl+e show previous N" | Load earlier messages / expand all |
+| Click the StickyHeader / "↓ N new messages" | Jump back to the pinned message / scroll to the bottom |
+| Click a hyperlink | Open it in your browser |
+| Keyboard selection extension | With a selection active, `Shift+←/→/↑/↓/Home/End` extends or shrinks it (wrapping across lines) |
 
 **Questionnaires** (when the model fires `ask_user_question`)
 
@@ -142,19 +213,22 @@ so keep using `Ctrl`.
 | `Space` | Toggle multi-select options |
 | `Tab` | Switch to a custom answer (type directly without picking an option) |
 | `Enter` | Submit the current selection |
-| `Esc` | Abort the question (the model receives ASK_ABORTED and can continue the conversation) |
+| `Esc` (from question 2 onward) | Return to the previous question and keep the current draft |
+| `Esc` (from question 1) / `Ctrl+C` | Cancel the whole question batch (the model receives ASK_CANCELLED and can continue the conversation) |
 
 **Local commands** (a full replica of the CC command set, all routed through the official DSH pipeline)
 
 | Group | Commands |
 |---|---|
-| Session | `/new` new session · `/resume` session browser (search, preview, cross-project, sub-agent runs folded) · `/rename` rename session · `/workspace resume|rename|open` manage workspaces · `/clear` clear screen · `/compact` compact · `/export` export Markdown · `/trace` trace timeline |
-| Status | `/context` loaded-context details · `/status` session info · `/cost` token usage · `/doctor` environment self-check · `/config` configuration sources · `/init` create AGENTS.md |
-| Model | `/model` picker · `/thinking` thinking display · `/tokens` token details · `/theme` theme picker · `/lang` zh/en UI switch (also selectable in `/settings`) |
+| Session | `/new` new session · `/resume` session browser (search, preview, cross-project, sub-agent runs folded) · `/rename` rename session · `/workspace resume|rename|open` manage workspaces · `/clear` clear screen · `/compact` compact · `/export` export Markdown · `/trace` trace timeline (or `Ctrl+T`) · `/rewind` rewind picker (same as double-`Esc` on empty input) · `/btw <question>` side question (never interrupts the main turn, writes no history) |
+| Status | `/context` loaded-context details · `/status` session info · `/cost` token usage · `/doctor` environment self-check · `/config` configuration sources · `/init` create AGENTS.md · `/settings` settings panel (namespace read/edit) |
+| Model | `/model` picker (**switching = fork continuation, history preserved**) · `/effort` reasoning effort (slider / `status` / `<id>`) · `/preset` agent preset (**cannot switch once the session has started** — blank-only) · `/thinking` thinking display · `/tokens` token details · `/activity` working animation (`frames <name>` / `status`) · `/theme` theme picker · `/lang` zh/en UI switch (also selectable in `/settings`) |
 | Accounts/Policy | `/provider` add a model provider · `/login` credential status · `/logout` logout notes · `/permissions` permission notes · `/add-dir` file-policy scope · `/hooks` · `/mcp` |
 | Skills | `/audit` code audit · `/bug` bug report · `/review` code review · `/practice` coding practice · `/pr_comments` PR comments · `/release-notes` release notes · `/vuln-check` vulnerability check |
-| Other | `/agents` subagent list · `/update` auto-update and restart · `/vim` · `/terminal-setup` · `/connect` · `/help` · `/exit` |
-| Registry | `/plan` `/goal` (DSH command-registry plugins, merged into the `/` menu automatically with the plugin) |
+| Other | `/agents` subagent list · `/skills` skills directory · `/plugins check <path>` plugin diagnostics · `/update` auto-update and restart · `/vim` · `/terminal-setup` · `/connect` · `/help` · `/exit` (aliases `/quit` `/q`) |
+| Registry | `/plan` `/goal` `/feedback` `/permission` (DSH command-registry plugins, merged into the `/` menu automatically with the plugin) |
+
+> Unknown commands are sent to the model as ordinary messages (e.g. in a composition where `/permission` is not mounted).
 
 ## Documentation
 
@@ -224,6 +298,16 @@ chat / tool base events ──> persisted Session log ──> TUI / Web
 - **Layout-level virtualization**: per-frame cost for long sessions drops from
   O(entire session) to O(visible window) — off-screen message lines render as
   height-only placeholders whose subtrees never take part in layout.
+- **Zero-allocation hot paths**: the visibleRows pipeline (slice/filter/margins)
+  is memoized on rows identity, length, and a Uint8Array streaming-bit
+  fingerprint — zero array/Map allocations per scroll tick, while in-place
+  settle writes still rebuild the cache instantly (empty-row filtering never
+  lags); wrapText and markdown tokens flow through global LRU caches that
+  reuse measurements across mounts.
+- **Framed backfill and landing anchor**: opening the main screen mounts the
+  tail window first and backfills history in frames; `/resume` asserts a final
+  state where the newest message's last row is visible and reachable, and
+  long-session restores skip the splash animation to land straight on content.
 - **Context progress bar**: based on the pi-nano-context algorithm (largest-remainder
   segmented coloring + multi-level condensed readouts).
 - **TPS meter**: based on pi-tps-meter — a streaming 1/8-block gauge, historical
@@ -264,6 +348,12 @@ chat / tool base events ──> persisted Session log ──> TUI / Web
 - `/vim` `/connect` `/hooks` are CC-named placeholders: the corresponding
   capabilities have no equivalent mechanism on the DSH side, and the commands give an
   explicit explanation rather than staying silent.
+- The `/thinking` display toggle is **not persisted**; restarts and new sessions fall
+  back to the default.
+- `/compact` is unavailable under the `minimal` preset (that preset does not compose
+  compaction).
+- `/update` works only when started via `dsh --profile` and is refused while a turn is
+  running.
 
 See [Architecture and limitations](docs/architecture.en.md) for the complete list of
 known limitations and the security boundary.
@@ -279,8 +369,10 @@ pnpm smoke
 ```
 
 `lib/types/` is ignored generated output. `pnpm build` recompiles it from a
-clean output directory and runs the build gates. npm Git URL installs generate
-the same runtime through `prepare`. Rendering, questionnaire, or tool-card
+clean output directory and runs the build gates. **Git URL installs are not supported** (the source manifest keeps
+`@dsh-std/*` as workspace deps, `vendor/dsh-std` is a submodule, and pnpm ≥11 refuses
+git-hosted `prepare` scripts by default); install the registry package:
+`dsh plugin --profile dsh-tui add @deepseek-harness-tui/dsh-tui`. Rendering, questionnaire, or tool-card
 changes also require the relevant regression scripts.
 
 ## Plugin Ecosystem

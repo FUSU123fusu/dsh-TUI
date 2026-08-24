@@ -19,9 +19,11 @@ import { stringWidth } from '../ink/stringWidth.js'
 import { supportsHyperlinks } from '../ink/supports-hyperlinks.js'
 import { colorize } from '../ink/colorize.js'
 import { getActiveTheme } from '../theme.js'
+import { buildSyntaxTheme } from './syntaxTheme.js'
 import type { CliHighlight } from './cliHighlight.js'
 import { logForDebugging } from '../utils/debug.js'
 import { createHyperlink } from './hyperlink.js'
+import { fileLinkUrl, linkifyFilePaths, looksLikeFilePath } from '../utils/fileTarget.js'
 
 // '\n' is used unconditionally — os.EOL is '\r\n' on Windows, and the stray
 // '\r' breaks the character-to-segment mapping in applyStylesToWrappedText,
@@ -81,6 +83,37 @@ export function configureMarked(): void {
 /** Inline code is painted with the active theme's permission accent. */
 function paintInlineCode(text: string): string {
   return colorize(text, getActiveTheme().permission, 'foreground')
+}
+
+/**
+ * Inline code that reads as a file path becomes a clickable target (the
+ * OSC 8 wrap keeps the code's permission color via the identity style —
+ * createHyperlink's default blue would otherwise override it). Terminals
+ * without OSC 8 support keep the plain painted code span.
+ */
+function renderCodeSpan(token: Tokens.Codespan): string {
+  const painted = paintInlineCode(token.text)
+  if (!looksLikeFilePath(token.text)) return painted
+  if (!supportsHyperlinks()) return painted
+  return createHyperlink(fileLinkUrl(token.text), painted, {
+    style: (text: string) => text,
+  })
+}
+
+/**
+ * Linkify path-like text into clickable file targets, then issue
+ * references (owner/repo#123). File spans exclude `#`, so the two
+ * linkifiers cannot nest or overlap. Without OSC 8 support the text stays
+ * untouched (createHyperlink's URL fallback would show the raw encoded
+ * `dsh-file:` payload — worse than plain text).
+ */
+function linkifyText(text: string): string {
+  const withFiles = supportsHyperlinks()
+    ? linkifyFilePaths(text, (path, display) =>
+        createHyperlink(fileLinkUrl(path), display),
+      )
+    : text
+  return linkifyIssueReferences(withFiles)
 }
 
 /**
@@ -155,7 +188,10 @@ export function applyMarkdown(
     .lexer(stripPromptXMLTags(content))
     .map(token => dispatch(token, rootState))
     .join('')
-    .trim()
+    // trimEnd only: the input is already trimmed, so leading whitespace in
+    // the output is renderer-intended (e.g. the code block's 2-space indent
+    // on its first line). A full trim() would eat that first-line indent.
+    .trimEnd()
 }
 
 /**
@@ -175,7 +211,7 @@ function isToken<K extends MarkedToken['type']>(
 function dispatch(token: Token, state: RenderState): string {
   if (isToken(token, 'blockquote')) return renderBlockquote(token, state)
   if (isToken(token, 'code')) return renderCodeBlock(token, state)
-  if (isToken(token, 'codespan')) return paintInlineCode(token.text)
+  if (isToken(token, 'codespan')) return renderCodeSpan(token)
   if (isToken(token, 'em')) return renderEmphasis(token, state)
   if (isToken(token, 'strong')) return renderStrong(token, state)
   if (isToken(token, 'heading')) return renderHeading(token, state)
@@ -210,20 +246,42 @@ function renderBlockquote(token: Tokens.Blockquote, state: RenderState): string 
 }
 
 function renderCodeBlock(token: Tokens.Code, state: RenderState): string {
-  if (!state.highlight) {
-    return token.text + EOL
-  }
-  let language = 'plaintext'
-  if (token.lang) {
-    if (state.highlight.supportsLanguage(token.lang)) {
-      language = token.lang
-    } else {
-      logForDebugging(
-        `Language not supported while highlighting code, falling back to plaintext: ${token.lang}`,
-      )
+  // Kimi Code style: a muted ```lang opening line (language tag + boundary
+  // for unhighlighted blocks) + 2-space indent; no closing fence (syntax
+  // colors or the indent already mark the end, it only cost vertical space).
+  const theme = getActiveTheme()
+  const openFence = colorize('```' + (token.lang ?? ''), theme.subtle, 'foreground')
+  const indent = '  '
+  const renderBody = (): string => {
+    if (!state.highlight) {
+      return token.text
     }
+    let language = 'plaintext'
+    if (token.lang) {
+      if (state.highlight.supportsLanguage(token.lang)) {
+        language = token.lang
+      } else {
+        logForDebugging(
+          `Language not supported while highlighting code, falling back to plaintext: ${token.lang}`,
+        )
+      }
+    }
+    return state.highlight.highlight(token.text, { language, theme: buildSyntaxTheme(theme) })
   }
-  return state.highlight.highlight(token.text, { language }) + EOL
+  // Strip ALL trailing newlines: trailing blank lines would otherwise leak a
+  // stray blank line at the end of the block.
+  const body = renderBody().replace(/\n+$/, '')
+  if (body === '') {
+    return `${openFence}${EOL}`
+  }
+  return (
+    openFence +
+    EOL +
+    body
+      .split(EOL)
+      .map(line => (line === '' ? line : indent + line))
+      .join(EOL) + EOL
+  )
 }
 
 function renderEmphasis(token: Tokens.Em, state: RenderState): string {
@@ -238,8 +296,15 @@ function renderStrong(token: Tokens.Strong, state: RenderState): string {
 
 function renderHeading(token: Tokens.Heading, state: RenderState): string {
   const text = token.tokens.map(child => dispatch(child, fresh(state))).join('')
-  // H1 gets the full banner treatment; every deeper level shares the bold style.
-  const styled = token.depth === 1 ? chalk.bold.italic.underline(text) : chalk.bold(text)
+  // Blue-primary progression: H1 gets the mist brand blue + underline, H2 the
+  // lighter border blue, deeper levels stay bold near-text (kimi-style).
+  const theme = getActiveTheme()
+  const styled =
+    token.depth === 1
+      ? chalk.bold.underline(colorize(text, theme.claude, 'foreground'))
+      : token.depth === 2
+        ? chalk.bold(colorize(text, theme.permission, 'foreground'))
+        : chalk.bold(text)
   return styled + EOL + EOL
 }
 
@@ -298,11 +363,14 @@ function renderText(token: Tokens.Text, state: RenderState): string {
     const bullet = ordinal === null ? '-' : `${formatListMarker(listDepth, ordinal)}.`
     const body = token.tokens
       ? token.tokens.map(child => dispatch(child, withParent(state, token))).join('')
-      : linkifyIssueReferences(token.text)
-    return `${bullet} ${body}${EOL}`
+      : linkifyText(token.text)
+    // Blue bullet marker: list structure gets a tint without loading the
+    // whole item (kimi-style `•` in the accent color).
+    const tinted = colorize(bullet, getActiveTheme().permission, 'foreground')
+    return `${tinted} ${body}${EOL}`
   }
 
-  return linkifyIssueReferences(token.text)
+  return linkifyText(token.text)
 }
 
 function renderTable(token: Tokens.Table, state: RenderState): string {

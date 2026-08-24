@@ -6,13 +6,14 @@
 process.env.DSH_TUI_LANG = 'en'
 process.env.FORCE_COLOR = '3'
 
-const [{ Writable }, React, { Terminal: XTerm }, { render, ThemeProvider }, { LoadedContextPanel }] =
+const [{ Writable }, React, { Terminal: XTerm }, { render, ThemeProvider }, { LoadedContextPanel }, { settle, viewportLines }] =
   await Promise.all([
     import('node:stream'),
     import('react'),
     import('@xterm/headless'),
     import('../src/ui.js'),
     import('../src/components/LoadedContextPanel.js'),
+    import('./lib/term-test.mjs'),
   ])
 
 const COLS = 60
@@ -51,7 +52,7 @@ const context = {
 
 const app = await render(
   <ThemeProvider theme="dark">
-    <LoadedContextPanel context={context} />
+    <LoadedContextPanel context={context} open={false} onToggle={() => {}} />
   </ThemeProvider>,
   {
     stdout: new FakeStdout() as NodeJS.WriteStream,
@@ -60,12 +61,10 @@ const app = await render(
   },
 )
 
-await new Promise(resolve => setTimeout(resolve, 300))
+await settle(() =>
+  viewportLines(term, ROWS).some(line => line.includes('Context loaded') && line.includes('Ctrl+P')))
 
-const lines = Array.from(
-  { length: ROWS },
-  (_, y) => term.buffer.active.getLine(y)?.translateToString(true) ?? '',
-)
+const lines = viewportLines(term, ROWS)
 const contentLines = lines.filter(line => line.trim() !== '')
 
 await app.unmount()
@@ -78,8 +77,8 @@ if (contentLines.length !== 1) {
 if (!contentLines[0]?.includes('Context loaded')) {
   throw new Error(`Collapsed context summary was not rendered: ${contentLines[0] ?? ''}`)
 }
-if (contentLines[0]?.includes('Ctrl+T')) {
-  throw new Error(`Context summary still claims the trajectory shortcut: ${contentLines[0] ?? ''}`)
+if (!contentLines[0]?.includes('Ctrl+P')) {
+  throw new Error(`Collapsed context summary lost the expand hint: ${contentLines[0] ?? ''}`)
 }
 
 process.stdout.write('loaded context narrow-width regression passed\n')

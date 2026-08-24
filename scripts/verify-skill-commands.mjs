@@ -11,6 +11,7 @@
  */
 import { createChannel } from '../lib/types/dsh-adapter/channel.js'
 import { LOCAL_COMMANDS } from '../lib/types/commands.js'
+import { settle } from './lib/term-test.mjs'
 
 let failed = 0
 function check(name, ok, extra = '') {
@@ -100,7 +101,9 @@ check(
   !channel.commandList.some(command => command.name === 'i-h'),
 )
 
-await tick()
+await settle(() =>
+  channel.commandList.some(command => command.name === 'i-h') &&
+  channel.commandList.some(command => command.name === 'helper'))
 
 // ---- async phase: user-invocable skills merged, marked, deduped
 const names = channel.commandList.map(command => command.name)
@@ -136,7 +139,9 @@ if (skillsChange === undefined || skillsChange.length === 0) {
 } else {
   check('skills/change handler captured', true)
   fire('skills/change')
-  await tick()
+  await settle(() =>
+    channel.commandList.some(command => command.name === 'newskill') &&
+    !channel.commandList.some(command => command.name === 'helper'))
   const refreshed = channel.commandList.map(command => command.name)
   check('removed skill leaves the menu', !refreshed.includes('helper'))
   check('added skill enters the menu', refreshed.includes('newskill'))
@@ -152,7 +157,7 @@ ctx.get = (name) => {
 let warned = 0
 ctx.logger = { warn() { warned += 1 } }
 fire('skills/change')
-await tick()
+await settle(() => warned >= 1)
 {
   const after = channel.commandList.map(command => command.name)
   check(
@@ -178,7 +183,7 @@ ctx.get = (name) => {
 }
 warned = 0
 fire('skills/change')
-await tick()
+await settle(() => warned >= 1)
 {
   const after = channel.commandList.map(command => command.name)
   check(
@@ -201,7 +206,9 @@ ctx.get = (name) => {
   return undefined
 }
 fire('skills/change')
-await tick()
+await settle(() =>
+  !channel.commandList.some(command => command.name === 'i-h') &&
+  !channel.commandList.some(command => command.name === 'newskill'))
 {
   const after = channel.commandList.map(command => command.name)
   check(
@@ -229,9 +236,11 @@ await tick()
     skills: [{ name: 'live', description: 'Live skill', invocation: { modelInvocable: true, userInvocable: true } }],
     complete: true,
   })
-  await tick()
+  await settle(() => channel.commandList.some(command => command.name === 'live'))
   check('superseding read repopulates the menu', channel.commandList.some(command => command.name === 'live'))
   pending[0].reject(new Error('stale scan failed'))
+  // Stability probe (nothing may change, nothing may warn): a settle over an
+  // already-true condition returns immediately — keep the fixed window.
   await tick()
   check('stale read failure logs no warning', staleWarned === 0, `warned=${staleWarned}`)
   check(
@@ -268,8 +277,7 @@ await tick()
     { name: 'review', description: 'Shadow skill (review)', invocation: { modelInvocable: true, userInvocable: true } },
   )
   fire('skills/change')
-  await tick()
-  await tick()
+  await settle(() => typeof registered.get('i-h')?.handler === 'function')
 
   check(
     'user-invocable skill is registered as a real command',
@@ -309,7 +317,7 @@ await tick()
     agent.followups.length = 0
     const outcome = await descriptor.handler({ agent, rawInput: ' 做年终总结', signal: undefined })
     check('kernel path reports success', outcome?.kind === 'success', JSON.stringify(outcome))
-    await tick()
+    await settle(() => agent.followups.length === 1)
     const gesture = agent.followups[0]
     check('kernel path delivers exactly one message', agent.followups.length === 1)
     check(
@@ -357,6 +365,90 @@ await tick()
   channel.releaseContributions()
   check('releaseContributions disposes the skill commands', !registered.has('i-h'))
   check('releaseContributions leaves other owners alone', registered.has('plan'))
+}
+
+// ---- /skills: an isolated channel must discard a snapshot from its old agent
+{
+  const staleAgentA = {
+    id: 'stale-a',
+    status: 'idle',
+    session: { id: 'stale-s1', seq: 0, events: [], header: { cwd: '/tmp' } },
+    ctx: { on: () => () => {} },
+    followups: [],
+    followup(message) { this.followups.push(message) },
+  }
+  const staleAgentB = {
+    id: 'stale-b',
+    status: 'idle',
+    session: { id: 'stale-s2', seq: 0, events: [], header: { cwd: '/tmp' } },
+    ctx: { on: () => () => {} },
+    followups: [],
+    followup(message) { this.followups.push(message) },
+  }
+  let holdNextAgentASnapshot = false
+  let pendingSnapshotResolve = () => {}
+  let pendingSnapshotStarted = false
+  let lastSnapshotScope
+  const skillService = {
+    list: async () => [],
+    snapshot(options) {
+      lastSnapshotScope = options?.scope
+      if (options?.scope === staleAgentA && holdNextAgentASnapshot) {
+        holdNextAgentASnapshot = false
+        pendingSnapshotStarted = true
+        return new Promise(resolve => { pendingSnapshotResolve = resolve })
+      }
+      return Promise.resolve({
+        skills: options?.scope === staleAgentA
+          ? [{ name: 'stable', description: 'Stable skill', invocation: { modelInvocable: true, userInvocable: true } }]
+          : [{ name: 'fresh', description: 'Fresh skill', invocation: { modelInvocable: true, userInvocable: true } }],
+        complete: true,
+      })
+    },
+    get: async () => undefined,
+  }
+  const staleCtx = {
+    on: () => () => {},
+    get(name) {
+      if (name === 'agents') {
+        return {
+          create: async () => ({ agent: staleAgentB }),
+        }
+      }
+      if (name === 'skills') return skillService
+      return undefined
+    },
+    logger: { warn() {} },
+  }
+  const staleChannel = createChannel(staleCtx, staleAgentA, {
+    model: 'deepseek-chat',
+    cwd: '/tmp',
+    provider: 'deepseek',
+    activity: false,
+  })
+
+  holdNextAgentASnapshot = true
+  const pendingList = staleChannel.listSkills()
+  check(
+    'pending /skills read starts from the independent agent A',
+    pendingSnapshotStarted && lastSnapshotScope === staleAgentA,
+  )
+  const switched = await staleChannel.newSession()
+  check('newSession switches the independent channel to agent B', switched === true)
+  pendingSnapshotResolve({
+    skills: [{ name: 'stale', description: 'Stale skill', invocation: { modelInvocable: true, userInvocable: true } }],
+    complete: true,
+  })
+  const staleSkills = await pendingList
+  check(
+    'stale /skills snapshot is hidden after an agent swap',
+    staleSkills === undefined,
+  )
+  const freshSkills = await staleChannel.listSkills()
+  check(
+    'current agent B returns a fresh /skills snapshot',
+    freshSkills?.some(skill => skill.name === 'fresh') === true,
+  )
 }
 
 console.log(failed === 0 ? 'ALL PASS' : `${failed} FAILED`)

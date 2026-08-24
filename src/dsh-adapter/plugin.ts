@@ -16,24 +16,38 @@ import { ApprovalStore } from './approvals.js'
 import { registerPackagedSkills } from './packaged-skills.js'
 import { registerPromptDebug } from './promptDebug.js'
 import { readActivityFrames } from '../activityPrefs.js'
+import { commitFullscreenFactoryMigration, planFullscreenFactoryMigration, readAppliedMigrations } from '../migrationPrefs.js'
 import { readModelPref } from '../modelPrefs.js'
 import { explicitModelRoute, recordedModelRoute, resolveModelRoute, validateModelRoute } from '../modelRoute.js'
 import type { ModelRoute } from '../modelRoute.js'
 import { readPresetPref } from '../presetPrefs.js'
-import { composePreset, filterMinimalPresetTools, resolvePersistedPreset, runningPresetOf } from './presets.js'
+import { composePreset, filterMinimalPresetTools, resolvePersistedPreset, resolvePersistedRoute, runningPresetOf } from './presets.js'
 import { ensurePackagedPresets } from './packaged-presets.js'
 import { ensureLegacySessionEventTypes } from './compat/index.js'
 import { clearResumeTarget, writeResumeTarget } from '../sessionHistory.js'
 import { resolveSessionCwd } from '../utils/workspaceRoot.js'
-import { checkForTuiUpdate, installedTuiVersion, isBootDeadlockTarget, isVersionNewer, resolveDshProfileName, resolveTuiUpdateTarget, updateTuiAndRestart } from '../update.js'
+import { beginRestartAttempt, checkForTuiUpdate, installedTuiVersion, isBootDeadlockTarget, isVersionNewer, logRestartEvent, resolveDshProfileName, resolveTuiUpdateTarget, restartTui, updateTuiAndRestart, writeHandoffNotice } from '../update.js'
 import { getLang, isLang, resolveStartupLang, setLang, t, writeLangPref } from '../i18n.js'
+import { DEFAULT_STATUS_BAR, normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import {
+  draftComboConflicts,
+  effectiveComboString,
+  parseComboDraft,
+  setKeymapOverrides,
+  SHORTCUT_ACTIONS,
+  type ShortcutActionId,
+} from '../utils/keymap.js'
 import { detectLegacyEnv, migrateLegacyDataDir, RENAMED_ENV } from '../utils/paths.js'
+import { attachHerdrIntegration } from '../herdr.js'
+import { logMouseDebug } from '../utils/debug.js'
 import { Chat } from '../screens/Chat.js'
-import type { TuiDialogRuntime } from './dialogs.js'
-import type { TuiStatusRuntime } from './status.js'
-import type { TuiShortcutRuntime } from './shortcuts.js'
+import { getHostDialogStore, type TuiDialogRuntime } from './dialogs.js'
+import { getHostStatusStore, type TuiStatusRuntime } from './status.js'
+import { getHostShortcuts, type TuiShortcutRuntime } from './shortcuts.js'
 import { attachSessionToWorkspace } from './workspace.js'
-import { createLocalWorkspaceRuntime } from './workspaces.js'
+import { createLocalWorkspaceRuntime, getHostWorkspaceRuntime } from './workspaces.js'
+import { getHostSettingsSections, type TuiSettingsField, type TuiSettingsSectionsRuntime } from './settings-sections.js'
+import { withHostRootCapability } from './host-access.js'
 import { render, ThemeProvider, AlternateScreen } from '../ui.js'
 import instances from '../ink/instances.js'
 import { cursorMove, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, DISABLE_WIN32_INPUT_MODE } from '../ink/termio/csi.js'
@@ -49,8 +63,80 @@ import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, supportsTabStatus, wrapForMult
  * `dsh-jsonrpc`: the surrounding `cordis.yml` supplies the agent spine, the
  * LLM adapter, and the tool plugins.
  */
+/**
+ * Fullscreen decision latched across host recomposes. The launcher disposes
+ * and re-mounts the plugin tree (teardown → apply() runs again) — a fresh
+ * apply() re-resolves `bootedFullscreen` from cordis config, and the
+ * settings user layer (settings.yaml) can arrive after the 300ms
+ * `settingsReady` bound when the recompose is also re-mounting the settings
+ * service. The tree would then mount INLINE and `fullscreenFrozen` would
+ * swallow the late application — the app lands on the main screen
+ * ("exited fullscreen", dead mouse, unpinned input) until restart. A
+ * session that already mounted fullscreen must never regress on a
+ * recompose: latch the decision.
+ */
+let lastBootedFullscreen: boolean | undefined
+
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  // /restart handoff diagnosis: the replacement process is marked by env and
+  // logs its boot progress to ~/.dsh-tui/restart.log (ordinary launches stay
+  // silent). First line lands before anything in this function can throw.
+  if (process.env.DSH_TUI_RESTART_CHILD === '1') {
+    logRestartEvent('boot: plugin apply', {
+      stdoutTty: process.stdout.isTTY === true,
+      stdinTty: process.stdin.isTTY === true,
+      stderrTty: process.stderr.isTTY === true,
+    })
+    // Field evidence (2026-08-24): the restarted TUI mounts but takes no
+    // input, and the terminal's DA reply surfaced on PS's prompt line in an
+    // earlier attempt — meaning NO process was reading console input. Probe
+    // whether THIS process's stdin pump ever sees bytes: wrap read()
+    // transparently (delegates; purely observational) and sample the pump
+    // state, so the log distinguishes "bytes never arrive" (console-level
+    // theft/mode) from "bytes arrive but the UI ignores them".
+    const probedStdin = process.stdin as NodeJS.ReadStream & { isRaw?: boolean }
+    const originalRead = probedStdin.read.bind(probedStdin)
+    let loggedChunks = 0
+    probedStdin.read = ((...args: Parameters<typeof originalRead>) => {
+      const chunk = originalRead(...args)
+      if (chunk !== null && chunk !== '' && loggedChunks < 12) {
+        loggedChunks += 1
+        const text = String(chunk)
+        logRestartEvent('boot: stdin chunk arrived', {
+          bytes: text.length,
+          preview: text.slice(0, 24).replace(/[^\x20-\x7e]/g, '.'),
+        })
+      }
+      return chunk
+    }) as typeof originalRead
+    const sampleStdinState = (label: string): void => {
+      logRestartEvent(`boot: ${label}`, {
+        isRaw: probedStdin.isRaw === true,
+        readableListeners: probedStdin.listenerCount('readable'),
+        dataListeners: probedStdin.listenerCount('data'),
+        paused: probedStdin.isPaused,
+        buffered: probedStdin.readableLength,
+        chunksSeen: loggedChunks,
+      })
+    }
+    sampleStdinState('stdin state at plugin apply')
+    let pendingSamples = 0
+    const sampleAt = (delayMs: number, label: string): void => {
+      pendingSamples += 1
+      const timer = setTimeout(() => {
+        pendingSamples -= 1
+        sampleStdinState(label)
+      }, delayMs)
+      timer.unref?.()
+    }
+    sampleAt(2000, 'stdin state +2s')
+    sampleAt(5000, 'stdin state +5s')
+    sampleAt(12000, 'stdin state +12s')
+  }
   if (!process.stdout.isTTY) {
+    if (process.env.DSH_TUI_RESTART_CHILD === '1') {
+      logRestartEvent('boot: TTY gate failed - stdout is not a TTY')
+    }
     throw new Error('dsh-tui requires an interactive terminal (stdout must be a TTY).')
   }
 
@@ -122,6 +208,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           process.stderr.write(
             `\ndsh-tui: 更新后版本未变化（仍为 ${now ?? 'unknown'}，原为 ${updatedFrom}）；` +
               `可能是镜像 registry 未同步，请稍后重试或检查 registry 配置。\n`,
+          )
+        }
+      } else if (process.stderr.isTTY) {
+        // Launcher alignment bridge (0.8.3): /update only replaces the
+        // package inside the DSH profile; a globally installed `dsh-tui`
+        // launcher is a separate copy that keeps its old version. Launchers
+        // >=0.8.3 export DSH_TUI_LAUNCHER_VERSION so we can tell whether
+        // the outer launcher lags the freshly installed profile. Launchers
+        // <=0.8.2 never set the marker — the generic branch below is
+        // intentionally one-shot: DSH_TUI_UPDATED_FROM exists only on the
+        // replacement process immediately after /update.
+        const launcherVersion = process.env.DSH_TUI_LAUNCHER_VERSION
+        if (launcherVersion === undefined) {
+          process.stderr.write(`\n[dsh-tui] ${t('update-launcher-align-unknown', { version: now })}\n`)
+        } else if (isVersionNewer(now, launcherVersion)) {
+          process.stderr.write(
+            `\n[dsh-tui] ${t('update-launcher-outdated', { profile: now, launcher: launcherVersion })}\n`,
           )
         }
       }
@@ -231,7 +334,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // without the service means the patch came from an older dsh-tui copy
   // than the running code — warn once so the skew is diagnosable. Bare
   // embedders (no --profile) take the same fallback by design, silently.
-  const mountedWorkspaceService = ctx.get('tuiWorkspaces')
+  const mountedWorkspaceService = getHostWorkspaceRuntime(ctx.get('tuiWorkspaces'))
   if (mountedWorkspaceService === undefined && resolveDshProfileName() !== undefined) {
     ctx.logger.warn(
       'dsh-tui: tuiWorkspaces service is not mounted; /workspace runs with the local-only fallback. ' +
@@ -324,6 +427,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // only explicit values so the target session's own record wins.
     configuredModel: config.model,
     configuredProvider: config.provider,
+    // Raw cordis.yml `lang` / `activityFrames`: /reload must not override a
+    // static deployment choice with the persisted preference.
+    configuredLang: config.lang,
+    configuredActivityFrames: config.activityFrames,
     effort: config.effort,
     activity: config.activity,
     // Explicit cordis.yml value (static deployment choice) wins over the
@@ -341,62 +448,294 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Edit/Write diff presentation (schema default 'auto'); the /settings
     // screen edits this key live through the dsh-tui namespace.
     diffLayout: config.diffLayout,
+    thinkingFold: config.thinkingFold,
+    toolBackground: config.toolBackground,
+    scrollGutter: config.scrollGutter,
+    statusBar: config.statusBar,
     handle,
+  })
+  // Fullscreen layout decision: the settings user layer (edited through the
+  // /settings screen) overrides cordis.yml when set. The settings injection
+  // below resolves it synchronously when the host settings service is up —
+  // i.e. before the tree mounts. `fullscreenFrozen` latches at mount: the
+  // exit funnel and the AlternateScreen wrap must keep reading the mode this
+  // session ACTUALLY runs, never a mid-session edit meant for the next boot
+  // (swapping layouts requires re-mounting the whole tree).
+  let bootedFullscreen = config.fullscreen === true
+  let fullscreenFrozen = false
+  // The settings service may come up AFTER this plugin's apply: the cordis
+  // inject callback defers until the service registers, so the first
+  // `apply(scope.get())` below can land after the mount (field report: the
+  // /settings fullscreen toggle never took effect — the frozen latch below
+  // swallowed the late callback and bootedFullscreen stayed false). The
+  // mount must therefore WAIT for the first settings application (bounded —
+  // a bare embedder without a settings service must not deadlock).
+  let resolveSettingsReady: (() => void) | undefined
+  const settingsReady = new Promise<void>(resolve => {
+    resolveSettingsReady = () => resolve()
+    setTimeout(resolve, 300)
   })
   // Register the dsh-tui settings namespace so the /settings screen can
   // edit it (the section below was '命名空间未注册' without this): the
   // user layer in settings.yaml wins over cordis.yml's diffLayout, and
   // watch() lands commits on the live channel — no recompose needed.
   ctx.inject(['settings'], (settingsCtx) => {
+    const tuiSettingsNs = settingsNamespace('dsh-tui')
     const scope = settingsCtx.settings.register(
-      settingsNamespace('dsh-tui'),
+      tuiSettingsNs,
       Schema.object({
         diffLayout: Schema.union(['auto', 'split', 'unified']).default('auto'),
+        thinkingFold: Schema.union(['preview', 'full']).default('preview'),
+        toolBackground: Schema.union(['none', 'subtle', 'strong']).default('none'),
+        scrollGutter: Schema.union(['timeline', 'scrollbar', 'hidden']).default('timeline'),
+        statusBar: Schema.object({
+          compact: Schema.boolean().default(DEFAULT_STATUS_BAR.compact),
+          model: Schema.boolean().default(DEFAULT_STATUS_BAR.model),
+          thinking: Schema.boolean().default(DEFAULT_STATUS_BAR.thinking),
+          cwd: Schema.boolean().default(DEFAULT_STATUS_BAR.cwd),
+          contextUsage: Schema.boolean().default(DEFAULT_STATUS_BAR.contextUsage),
+          cache: Schema.boolean().default(DEFAULT_STATUS_BAR.cache),
+          tokens: Schema.boolean().default(DEFAULT_STATUS_BAR.tokens),
+          tps: Schema.boolean().default(DEFAULT_STATUS_BAR.tps),
+          gitBranch: Schema.boolean().default(DEFAULT_STATUS_BAR.gitBranch),
+          sessionTitle: Schema.boolean().default(DEFAULT_STATUS_BAR.sessionTitle),
+          sessionId: Schema.boolean().default(DEFAULT_STATUS_BAR.sessionId),
+          goal: Schema.boolean().default(DEFAULT_STATUS_BAR.goal),
+          mode: Schema.boolean().default(DEFAULT_STATUS_BAR.mode),
+          contextBar: Schema.boolean().default(DEFAULT_STATUS_BAR.contextBar),
+          activity: Schema.boolean().default(DEFAULT_STATUS_BAR.activity),
+          trajectory: Schema.boolean().default(DEFAULT_STATUS_BAR.trajectory),
+          shortcutHint: Schema.boolean().default(DEFAULT_STATUS_BAR.shortcutHint),
+        }).default({ ...DEFAULT_STATUS_BAR }),
+        // Header pixel whale art; on unless settings.yaml says otherwise.
+        whale: Schema.boolean().default(true),
+        // Minimal mode: strips the header splash, emoji glyphs, and
+        // decorative colors; code highlight and tool colors stay.
+        minimal: Schema.boolean().default(false),
         // No default on purpose: an unset `lang` keeps the field showing
         // the effective language (see the section's format below) and lets
         // cordis.yml / lang.json keep their precedence.
         lang: Schema.union(['zh', 'en']),
+        // Same no-default rule: unset keeps cordis.yml's `fullscreen`
+        // decisive; set overrides it from the next boot on.
+        fullscreen: Schema.boolean(),
+        // Built-in action-shortcut overrides, one optional combo string per
+        // action (see src/utils/keymap.ts). Unset keeps the default binding
+        // and the section's format() shows the effective combos.
+        shortcuts: Schema.object(
+          Object.fromEntries(SHORTCUT_ACTIONS.map(action => [action.id, Schema.string().required(false)])),
+        ).required(false),
       }),
     )
-    const applyLayout = (value: { diffLayout?: 'auto' | 'split' | 'unified' }): void => {
+    type SettingsValue = {
+      diffLayout?: 'auto' | 'split' | 'unified'
+      lang?: 'zh' | 'en'
+      whale?: boolean
+      minimal?: boolean
+      fullscreen?: boolean
+      thinkingFold?: 'preview' | 'full'
+      toolBackground?: ToolBackground
+      scrollGutter?: ScrollGutterMode
+      statusBar?: Partial<StatusBarConfig>
+      shortcuts?: Partial<Record<ShortcutActionId, string>>
+    }
+    const applyLayout = (value: SettingsValue): void => {
       channel.setDiffLayout(value.diffLayout ?? config.diffLayout ?? 'auto')
+    }
+    const applyWhale = (value: { whale?: boolean }): void => {
+      channel.setWhale(value.whale ?? true)
+    }
+    const applyMinimal = (value: { minimal?: boolean }): void => {
+      channel.setMinimal(value.minimal ?? false)
+    }
+    // Fullscreen: only meaningful before the tree mounts (the freeze latch
+    // above). A later doc change (mid-session /settings edit) is persisted
+    // by the service and picked up on the next boot; the watch below says
+    // so with a notify.
+    const applyFullscreen = (value: SettingsValue): void => {
+      if (!fullscreenFrozen && typeof value.fullscreen === 'boolean') {
+        bootedFullscreen = value.fullscreen
+      }
     }
     // The /settings language field writes `lang` through the settings
     // service (user layer): apply it live and mirror it to lang.json so
     // the /lang command and next-boot resolution agree. DSH_TUI_LANG
     // stays the top precedence — a pinned env is never overridden by the
     // document.
-    const applyLang = (value: { lang?: 'zh' | 'en' }): void => {
+    const applyLang = (value: SettingsValue): void => {
       if (!isLang(process.env.DSH_TUI_LANG) && isLang(value.lang)) {
         setLang(value.lang)
         writeLangPref(value.lang)
       }
     }
-    const apply = (next: { diffLayout?: 'auto' | 'split' | 'unified'; lang?: 'zh' | 'en' }): void => {
-      applyLayout(next)
-      applyLang(next)
+    // Display preferences ride the same namespace: /settings writes them
+    // live and future render consumers observe the channel version bump.
+    const applyDisplay = (value: SettingsValue): void => {
+      channel.setThinkingFold(value.thinkingFold ?? config.thinkingFold ?? 'preview')
+      channel.setToolBackground(normalizeToolBackground(value.toolBackground ?? config.toolBackground))
+      channel.setScrollGutter(normalizeScrollGutter(value.scrollGutter ?? config.scrollGutter))
+      channel.setStatusBar(normalizeStatusBar(value.statusBar ?? config.statusBar))
     }
-    apply(scope.get())
+    // Shortcut overrides resolve per action: settings user layer wins over
+    // cordis.yml's `shortcuts` (same precedence as every other field);
+    // unset everywhere keeps the registry default. Applied live into the
+    // keymap module — the very next keypress matches the new combos.
+    const applyShortcuts = (value: SettingsValue): void => {
+      const userLayer = value.shortcuts ?? {}
+      const configLayer = config.shortcuts ?? {}
+      const merged: Partial<Record<ShortcutActionId, string>> = {}
+      for (const action of SHORTCUT_ACTIONS) {
+        const user = userLayer[action.id]
+        const pinned = configLayer[action.id]
+        const chosen = typeof user === 'string' && user.trim() !== ''
+          ? user
+          : (typeof pinned === 'string' && pinned.trim() !== '' ? pinned : undefined)
+        if (chosen !== undefined) merged[action.id] = chosen
+      }
+      setKeymapOverrides(merged)
+    }
+    const apply = (next: SettingsValue): void => {
+      applyLayout(next)
+      applyWhale(next)
+      applyMinimal(next)
+      applyLang(next)
+      applyDisplay(next)
+      applyShortcuts(next)
+      applyFullscreen(next)
+    }
+    // One-time fullscreen factory-default migration (companion to the
+    // schema + cordis.patch.yml flip false→true): a `fullscreen: false`
+    // pinned in the settings user layer BEFORE the flip keeps overriding
+    // the new default on every boot. The first boot past this code clears
+    // that stale explicit choice; the migrations.json marker makes it
+    // strictly once, so a `false` re-pinned afterwards always stands. The
+    // boot decision cannot wait for the async doc write — the stale value
+    // is shadowed out of the first apply below (destructuring omission,
+    // not an explicit undefined), and the later watch commit (fullscreen
+    // back to undefined) is a no-op for applyFullscreen.
+    const bootSettings = scope.get()
+    const fullscreenMigration = planFullscreenFactoryMigration(bootSettings.fullscreen, readAppliedMigrations())
+    void commitFullscreenFactoryMigration(fullscreenMigration, {
+      unset: () => settingsCtx.settings.mutate(tuiSettingsNs, [{ op: 'unset', path: ['fullscreen'] }]),
+    })
+    if (fullscreenMigration === 'unset') {
+      channel.notify(t('settings-fullscreen-migrated'), { color: 'warning' })
+    }
+    const { fullscreen: staleFullscreen, ...migratedSettings } = bootSettings
+    apply(fullscreenMigration === 'unset' ? migratedSettings : bootSettings)
     scope.watch(next => {
       apply(next)
+      if (typeof next.fullscreen === 'boolean' && next.fullscreen !== bootedFullscreen) {
+        channel.notify(t('settings-fullscreen-restart'), { color: 'warning' })
+      }
     })
+    resolveSettingsReady?.()
   })
   // The /settings screen's own section: the dsh-tui namespace comes from
   // the settings registration above, and the declared selects write `lang`
   // and `diffLayout` back through the settings service's revision-fenced
   // mutate (the watch applies both live).
-  const settingsSections = ctx.get('tuiSettingsSections') as
-    | { register(section: {
-        ns: string
-        title: string
-        descriptions?: Record<string, string>
-        fields: readonly unknown[]
-      }): () => void }
-    | undefined
+  //
+  // Shortcut fields: one text field per customizable action. The draft is
+  // one or more ctrl+/alt+ combos (comma-separated); blank restores the
+  // default, and a combo another action or a fixed editor binding already
+  // owns is refused as invalid so remaps can never silently shadow.
+  const shortcutFieldMeta: Record<ShortcutActionId, { label: string; zh: string; hintEn: (defaults: string) => string; hintZh: (defaults: string) => string }> = {
+    paste: {
+      label: 'Paste shortcut',
+      zh: '粘贴快捷键',
+      hintEn: d => `Clipboard paste (text, file paths, images). Default: ${d}. Alt+V works where the terminal eats Ctrl+V.`,
+      hintZh: d => `剪贴板粘贴（文本、文件路径、图片）。默认 ${d}。终端吞掉 Ctrl+V 时可用 Alt+V。`,
+    },
+    history: {
+      label: 'History search shortcut',
+      zh: '历史搜索快捷键',
+      hintEn: d => `Open the prompt-history search. Default: ${d}.`,
+      hintZh: d => `打开输入历史搜索。默认 ${d}。`,
+    },
+    editor: {
+      label: 'External editor shortcut',
+      zh: '外部编辑器快捷键',
+      hintEn: d => `Edit the draft in $VISUAL/$EDITOR. Default: ${d}.`,
+      hintZh: d => `在 $VISUAL/$EDITOR 外部编辑器中编辑草稿。默认 ${d}。`,
+    },
+    transcript: {
+      label: 'Transcript mode shortcut',
+      zh: '转录模式快捷键',
+      hintEn: d => `Toggle expanded transcript mode. Default: ${d}.`,
+      hintZh: d => `切换展开转录模式。默认 ${d}。`,
+    },
+    trajectory: {
+      label: 'Trajectory scene shortcut',
+      zh: '轨迹场景快捷键',
+      hintEn: d => `Open the trajectory scene. Default: ${d}.`,
+      hintZh: d => `打开轨迹场景。默认 ${d}。`,
+    },
+    dashboard: {
+      label: 'Subagent dashboard shortcut',
+      zh: '子代理面板快捷键',
+      hintEn: d => `Open the subagent dashboard. Default: ${d}.`,
+      hintZh: d => `打开子代理面板。默认 ${d}。`,
+    },
+    contextPanel: {
+      label: 'Loaded-context panel shortcut',
+      zh: '加载上下文面板快捷键',
+      hintEn: d => `Toggle the startup loaded-context panel. Default: ${d}.`,
+      hintZh: d => `切换启动时的已加载上下文面板。默认 ${d}。`,
+    },
+    showAll: {
+      label: 'Show-all shortcut',
+      zh: '显示全部消息快捷键',
+      hintEn: d => `Toggle show-all-messages. Default: ${d}.`,
+      hintZh: d => `切换显示全部消息。默认 ${d}。`,
+    },
+    redraw: {
+      label: 'Redraw shortcut',
+      zh: '终端重绘快捷键',
+      hintEn: d => `Clear and repaint the terminal. Default: ${d}.`,
+      hintZh: d => `清空并重绘终端。默认 ${d}。`,
+    },
+    todoFold: {
+      label: 'Todo fold shortcut',
+      zh: '待办折叠快捷键',
+      hintEn: d => `Fold/unfold the goal/todo panel. Default: ${d}.`,
+      hintZh: d => `折叠/展开目标与待办面板。默认 ${d}。`,
+    },
+  }
+  const shortcutFields: TuiSettingsField[] = SHORTCUT_ACTIONS.map(action => {
+    const meta = shortcutFieldMeta[action.id]
+    const defaults = action.defaults.join(', ')
+    return {
+      path: ['shortcuts', action.id],
+      label: meta.label,
+      descriptions: { zh: meta.zh },
+      hint: meta.hintEn(defaults),
+      hintDescriptions: { zh: meta.hintZh(defaults) },
+      group: 'shortcuts',
+      kind: 'text',
+      format(value: unknown): string {
+        return typeof value === 'string' && value.trim() !== '' ? value : effectiveComboString(action.id)
+      },
+      parse(text: string) {
+        const draft = parseComboDraft(text)
+        if (draft === undefined) return undefined
+        if (draft.combos.length === 0) return { kind: 'clear' }
+        if (draftComboConflicts(action.id, draft.combos)) return undefined
+        return { kind: 'set', value: draft.combos.join(', ') }
+      },
+    }
+  })
+  const settingsSections = getHostSettingsSections(
+    ctx.get('tuiSettingsSections') as TuiSettingsSectionsRuntime | undefined,
+  )
   if (settingsSections !== undefined) {
     const unregister = settingsSections.register({
       ns: 'dsh-tui',
       title: 'dsh-tui',
+      groups: [
+        { id: 'status-bar', title: 'Status bar', descriptions: { zh: '底栏设置' } },
+        { id: 'shortcuts', title: 'Shortcuts', descriptions: { zh: '快捷键' } },
+      ],
       fields: [
         {
           path: ['lang'],
@@ -417,6 +756,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           },
         },
         {
+          path: ['fullscreen'],
+          label: 'Fullscreen mode',
+          descriptions: { zh: '全屏模式' },
+          // 故意不用 "alt-screen" 这类终端术语：读者要的是行为差异。鼠标
+          // 两种模式都可用（整屏页面自带鼠标跟踪），别让描述暗示关掉就
+          // 没有鼠标——最常见的误解。长度对齐既有最长 hint（单行假设）。
+          hint: 'On: app takes the whole screen (vim/less style), in-app mouse. Off: native scrollback; full-page screens keep the mouse. Restart to apply.',
+          hintDescriptions: { zh: '开启：接管整个终端（同 vim/less），应用内鼠标；关闭：终端原生滚动选择；整屏页两种模式都有鼠标。重启生效。' },
+          kind: 'boolean',
+          format(value: unknown): string {
+            // Unset in settings.yaml: show what THIS session booted with
+            // (the cordis.yml resolution) instead of a misleading false.
+            return value === undefined || value === null ? String(bootedFullscreen) : String(value)
+          },
+        },
+        {
           path: ['diffLayout'],
           label: 'Diff layout',
           descriptions: { zh: 'diff 布局' },
@@ -428,6 +783,214 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             { value: 'split', label: 'Side-by-side', descriptions: { zh: '双栏对照' } },
             { value: 'unified', label: 'Unified', descriptions: { zh: '统一式' } },
           ],
+        },
+        {
+          path: ['thinkingFold'],
+          label: 'Thinking display',
+          descriptions: { zh: '思考块展示' },
+          hint: 'Streaming thinking shows a 2-3 line live preview and each step folds when it settles; Full keeps thinking expanded until the turn ends.',
+          hintDescriptions: { zh: '流式时思考显示 2-3 行动态预览，每步落定后折叠；展开模式保持思考展开直到整轮结束。' },
+          kind: 'select',
+          options: [
+            { value: 'preview', label: 'Preview (2-3 lines)', descriptions: { zh: '预览（2-3 行）' } },
+            { value: 'full', label: 'Full until turn end', descriptions: { zh: '展开至轮末' } },
+          ],
+        },
+        {
+          path: ['toolBackground'],
+          label: 'Tool background',
+          descriptions: { zh: '工具卡背景' },
+          hint: 'Choose whether tool-call cards add no, subtle, or strong background emphasis.',
+          hintDescriptions: { zh: '选择工具调用卡片不添加、轻微或明显的背景强调。' },
+          kind: 'select',
+          options: [
+            { value: 'none', label: 'None', descriptions: { zh: '无' } },
+            { value: 'subtle', label: 'Subtle', descriptions: { zh: '轻微' } },
+            { value: 'strong', label: 'Strong', descriptions: { zh: '明显' } },
+          ],
+        },
+        {
+          path: ['scrollGutter'],
+          label: 'Transcript gutter',
+          descriptions: { zh: '转录边栏' },
+          hint: 'Right gutter of the fullscreen transcript: per-turn timeline ticks, a proportional scrollbar, or nothing.',
+          hintDescriptions: { zh: '全屏转录区右侧边栏：按轮次的时间线节点、比例滚动条，或留空。' },
+          kind: 'select',
+          options: [
+            { value: 'timeline', label: 'Turn timeline', descriptions: { zh: '轮次时间线' } },
+            { value: 'scrollbar', label: 'Scrollbar', descriptions: { zh: '滚动条' } },
+            { value: 'hidden', label: 'Hidden', descriptions: { zh: '隐藏' } },
+          ],
+        },
+        ...shortcutFields,
+        {
+          path: ['statusBar', 'compact'],
+          label: 'Compact status bar',
+          descriptions: { zh: '紧凑状态栏' },
+          hint: 'Prefer the compact status presentation when terminal space allows.',
+          hintDescriptions: { zh: '终端空间允许时优先使用紧凑状态栏布局。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'model'],
+          label: 'Show model',
+          descriptions: { zh: '显示模型' },
+          hint: 'Show the live model id in the status bar.',
+          hintDescriptions: { zh: '在状态栏显示当前模型标识。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'thinking'],
+          label: 'Show thinking',
+          descriptions: { zh: '显示思考' },
+          hint: 'Show the live reasoning effort or thinking mode.',
+          hintDescriptions: { zh: '显示当前推理强度或思考模式。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'cwd'],
+          label: 'Show working directory',
+          descriptions: { zh: '显示工作目录' },
+          hint: 'Show the session working directory.',
+          hintDescriptions: { zh: '显示当前会话的工作目录。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'contextUsage'],
+          label: 'Show context usage',
+          descriptions: { zh: '显示上下文用量' },
+          hint: 'Show current context-window consumption.',
+          hintDescriptions: { zh: '显示当前上下文窗口占用情况。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'cache'],
+          label: 'Show cache',
+          descriptions: { zh: '显示缓存' },
+          hint: 'Show prompt-cache hit information.',
+          hintDescriptions: { zh: '显示提示词缓存命中信息。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'tokens'],
+          label: 'Show token totals',
+          descriptions: { zh: '显示 Token 总量' },
+          hint: 'Show running input and output token totals.',
+          hintDescriptions: { zh: '显示累计输入与输出 Token。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'tps'],
+          label: 'Show output speed',
+          descriptions: { zh: '显示输出速度' },
+          hint: 'Show live and recent tokens-per-second metrics.',
+          hintDescriptions: { zh: '显示实时及近期每秒 Token 指标。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'gitBranch'],
+          label: 'Show git branch',
+          descriptions: { zh: '显示 Git 分支' },
+          hint: 'Show the current git branch when available.',
+          hintDescriptions: { zh: '可用时显示当前 Git 分支。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'sessionTitle'],
+          label: 'Show session title',
+          descriptions: { zh: '显示会话标题' },
+          hint: 'Show the current session title.',
+          hintDescriptions: { zh: '显示当前会话标题。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'sessionId'],
+          label: 'Show session id',
+          descriptions: { zh: '显示会话 ID' },
+          hint: 'Show the short session id (# + first 8 chars) — it matches the session log filename for --resume.',
+          hintDescriptions: { zh: '显示短会话 ID（# + 前 8 位）——与日志文件名对应，方便 --resume 定位。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'goal'],
+          label: 'Show goal status',
+          descriptions: { zh: '显示 Goal 状态' },
+          hint: 'Show a compact goal chip (phase glyph + rounds) in the status footer while a goal exists.',
+          hintDescriptions: { zh: '存在 Goal 时，在底部状态栏显示紧凑的 Goal 状态（阶段符号与轮次）。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'mode'],
+          label: 'Show session mode',
+          descriptions: { zh: '显示会话模式' },
+          hint: 'Show the active non-default session mode.',
+          hintDescriptions: { zh: '显示当前启用的非默认会话模式。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'contextBar'],
+          label: 'Show context progress bar',
+          descriptions: { zh: '显示上下文进度条' },
+          hint: 'Show the segmented context progress bar on its own footer row.',
+          hintDescriptions: { zh: '在底部单独一行显示分段上下文进度条。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'activity'],
+          label: 'Show activity summary',
+          descriptions: { zh: '显示活动摘要' },
+          hint: 'Show the idle working-activity summary.',
+          hintDescriptions: { zh: '显示空闲时的工作活动摘要。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'trajectory'],
+          label: 'Show trajectory strip',
+          descriptions: { zh: '显示轨迹条' },
+          hint: 'Show the animated mini trajectory strip at the footer edge.',
+          hintDescriptions: { zh: '在状态栏边缘显示动态迷你轨迹条。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'shortcutHint'],
+          label: 'Show shortcut reminder',
+          descriptions: { zh: '显示快捷键提示' },
+          hint: 'Control only the idle `? for shortcuts` reminder; pressing ? and the Esc shortcut hints are unaffected.',
+          hintDescriptions: { zh: '仅控制空闲时的 `? for shortcuts` 提示；按 ? 打开快捷键以及 Esc 快捷提示均不受影响。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['whale'],
+          label: 'Whale art',
+          descriptions: { zh: '鲸鱼娘' },
+          hint: 'Show the pixel whale in the header splash.',
+          hintDescriptions: { zh: '开屏头部显示像素鲸鱼娘。' },
+          kind: 'boolean',
+        },
+        {
+          path: ['minimal'],
+          label: 'Minimal mode',
+          descriptions: { zh: '极简模式' },
+          hint: 'Hide the header splash, emoji glyphs, and decorative colors; code highlight and tool colors stay. Trims the status bar to model + cwd.',
+          hintDescriptions: { zh: '隐藏开屏头部、emoji 状态符与装饰性配色；代码高亮与工具配色保留，底栏只留模型与目录。' },
+          kind: 'boolean',
         },
       ],
     })
@@ -446,6 +1009,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     ctx.on('approval/request', (req, next) =>
       String(req.agent.id) === channel.agentId ? approvalStore.park(req) : next())
     ctx.effect(() => () => approvalStore.settleAll('cancelled'))
+  }
+  const herdr = attachHerdrIntegration({
+    channel,
+    questions: questionStore,
+    approvals: approvalStore,
+  })
+  if (herdr !== undefined) {
+    ctx.effect(() => () => herdr.dispose())
   }
   // Positional command-line arguments are the initial prompt (issue #53):
   // `dsh-tui "run the tests"` forwards positionals through the dsh CLI,
@@ -474,6 +1045,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let exited = false
   let updateRequested = false
   let updateTargetVersion: string | undefined
+  // `/restart` flag: same exit funnel as `/update` minus the pnpm step —
+  // write the resume target, restore the terminal, respawn the process with
+  // the original argv, and let the fresh boot attach the same session.
+  let restartRequested = false
   // The profile this process was booted with (`dsh --profile <name>`); dsh
   // exposes it nowhere else, and /update must update the installation the
   // user is actually running, not a hard-coded one.
@@ -494,7 +1069,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         void finishExit(
           ctx,
           instance,
-          config.fullscreen === true,
+          bootedFullscreen,
           undefined,
           `dsh-tui crashed: ${message}`,
           () => disposeRootAndExit(ctx, 1),
@@ -510,10 +1085,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         void finishExit(
           ctx,
           instance,
-          config.fullscreen === true,
+          bootedFullscreen,
           'Updating @deepseek-harness-tui/dsh-tui and restarting…',
           undefined,
           () => runUpdate(ctx, profile, channel.agentId, updateTargetVersion),
+        )
+        return
+      }
+      // `/restart`: same handoff as the update path, no installation step.
+      // The resume target is written unconditionally — the user asked to
+      // restart THIS session, blank or not (mirrors the update contract).
+      if (restartRequested) {
+        beginRestartAttempt(channel.agentId)
+        logRestartEvent('funnel: /restart branch entered')
+        try {
+          writeResumeTarget(channel.agentId)
+          logRestartEvent('funnel: resume target written')
+        } catch (error) {
+          // Resume persistence is best effort and must never block a restart.
+          logRestartEvent('funnel: resume target write failed', {
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
+        void finishExit(
+          ctx,
+          instance,
+          bootedFullscreen,
+          t('restart-starting'),
+          undefined,
+          () => runRestart(ctx, profile, channel.agentId),
         )
         return
       }
@@ -539,7 +1139,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       void finishExit(
         ctx,
         instance,
-        config.fullscreen === true,
+        bootedFullscreen,
         hint,
         undefined,
         () => disposeRootAndExit(ctx, 0),
@@ -548,6 +1148,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   const handleExit = funnel.handleExit
 
+  // Chat's `fullscreen` prop must match the root wrap below, or the
+  // full-screen surfaces inside Chat (session browser, settings, trajectory,
+  // subagent pages) would nest a SECOND <AlternateScreen> — whose unmount
+  // writes DEC 1049 exit and drops the whole app back to the main screen
+  // (the stable /resume→Esc "exited fullscreen" repro). The prop is captured
+  // when the element is created, so wait for the settings first-application
+  // BEFORE creating Chat: the element must see the same bootedFullscreen the
+  // root tree resolves after settingsReady below.
+  await settingsReady
   const chat = React.createElement(Chat, {
     channel,
     questionStore,
@@ -555,14 +1164,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // The dsh-tui-extensions row's services (managed dialogs, status line,
     // shortcuts). Soft-consumed: absent the row (stale patch, bare embed),
     // Chat falls back to inert stores and no shortcut registry.
-    extensionDialogs: (ctx.get('tuiDialogs') as TuiDialogRuntime | undefined)?.store,
-    extensionStatus: (ctx.get('tuiStatus') as TuiStatusRuntime | undefined)?.store,
-    extensionShortcuts: ctx.get('tuiShortcuts') as TuiShortcutRuntime | undefined,
+    extensionDialogs: getHostDialogStore(ctx.get('tuiDialogs') as TuiDialogRuntime | undefined),
+    extensionStatus: getHostStatusStore(ctx.get('tuiStatus') as TuiStatusRuntime | undefined),
+    extensionShortcuts: getHostShortcuts(ctx.get('tuiShortcuts') as TuiShortcutRuntime | undefined),
     // Full-screen surfaces inside Chat — the trajectory scene and the session
     // browser — enter the alt screen themselves in inline mode; in fullscreen
     // the tree is already wrapped below, so they must not nest.
-    fullscreen: config.fullscreen === true,
+    fullscreen: bootedFullscreen,
     onExit: () => handleExit(),
+    // `/restart`: respawn this process and resume the session, no update.
+    onRestart: () => {
+      if (exited || restartRequested) return
+      restartRequested = true
+      logRestartEvent('command: /restart accepted')
+      channel.notify(t('restart-starting'))
+      handleExit()
+    },
     // Only a `dsh --profile <name>` launch has a profile installation for
     // `/update` to act on; source checkouts and `--config` overlays get the
     // unavailable notice instead.
@@ -603,6 +1220,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       })
     },
   })
+  // Freeze the fullscreen decision only NOW, right before the tree mounts:
+  // Chat above was created after the same settingsReady await, so the root
+  // wrap and the `fullscreen` prop share one value; a mid-session /settings
+  // edit from here on is persisted for the next boot (the watch notifies),
+  // never applied live (swapping layouts requires re-mounting the tree).
+  // Host recompose hardening: never regress a fullscreen session to inline
+  // on a re-mount whose settings application arrived late (see the module
+  // latch note). A fresh process still resolves from config + settings
+  // normally — the latch is undefined there.
+  if (bootedFullscreen === false && lastBootedFullscreen === true) {
+    bootedFullscreen = true
+  }
+  fullscreenFrozen = true
   // fullscreen: wrap the tree in <AlternateScreen> (DEC 1049 + SGR mouse
   // tracking), which turns on in-app text selection (copy-on-select via
   // useCopyOnSelect), wheel scroll, and click/hover hit-testing. Inline
@@ -610,9 +1240,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const tree = React.createElement(
     ThemeProvider,
     null,
-    config.fullscreen ? React.createElement(AlternateScreen, null, chat) : chat,
+    bootedFullscreen ? React.createElement(AlternateScreen, null, chat) : chat,
   )
   instance = await render(tree, { exitOnCtrlC: false })
+  const isRecompose = lastBootedFullscreen !== undefined
+  lastBootedFullscreen = bootedFullscreen
+  logMouseDebug('apply mount', { bootedFullscreen, isRecompose })
+  // /restart handoff diagnosis: the replacement got all the way to a mounted
+  // UI, so any later death is post-boot (and its stderr keeps flowing to the
+  // parent only within the survival window — this line is the durable mark).
+  if (process.env.DSH_TUI_RESTART_CHILD === '1') {
+    logRestartEvent('boot: UI mounted', { fullscreen: bootedFullscreen, isRecompose })
+  }
 
   // Check in the background so registry latency never delays the first frame.
   // A failed/offline check is intentionally silent; the manual `/update`
@@ -634,6 +1273,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // skill commands (issue #86) would survive this exact recompose and the
   // re-mounted channel would find the names taken, freezing its menu.
   ctx.effect(() => () => {
+    logMouseDebug('apply teardown')
     funnel.markTeardown()
     channel.releaseContributions()
     instance?.unmount()
@@ -676,9 +1316,13 @@ async function resolveAgent(
 ): Promise<{ agent: Agent; handle?: AgentHandle; agentPreset?: string; route?: ModelRoute }> {
   // Resume override (issue #67): cordis.yml overrides the target session's
   // recorded route only when it pins BOTH halves; undefined halves let the
-  // session's own request/header records win (issue #30).
+  // session's own request/header records win (issue #30). The recorded route
+  // is ALSO fed back into agentOptions (not just the status line): a resume
+  // whose cordis.yml pins only `provider` would otherwise leave
+  // agentOptions.model undefined, which breaks the `{{model}}` persona
+  // variable for the resumed agent's own assembly and for every subagent it
+  // spawns (dsh-subagent inherits `parent.options.model`).
   const resumeRoute = explicitModelRoute(configuredRoute)
-  const resumeOptions = { provider: resumeRoute?.provider, model: resumeRoute?.model }
   if (requestedSessionId !== undefined) {
     const resumeId = SessionId(requestedSessionId)
     const existing = ctx.agents.get(resumeId)
@@ -695,6 +1339,11 @@ async function resolveAgent(
       // caller's current preference.
       const persisted = await resolvePersistedPreset(ctx, resumeId)
       const composed = await composePreset(ctx, persisted)
+      const recorded = await resolvePersistedRoute(ctx, resumeId)
+      const resumeOptions = {
+        provider: resumeRoute?.provider ?? recorded?.provider,
+        model: resumeRoute?.model ?? recorded?.model,
+      }
       const resumed = await ctx.agents.resume({
         resumeSessionId: resumeId,
         agentOptions: resumeOptions,
@@ -926,6 +1575,42 @@ function writeStream(stream: NodeJS.WriteStream, data: string): Promise<void> {
   })
 }
 
+/**
+ * Restart the TUI in place and resume the same session — the `/restart`
+ * tail of `/reload`: the soft reload cannot re-read boot-time-only state
+ * (cordis.yml root config, frozen fullscreen layout, newly built code), so
+ * /restart respawns the process with the original argv through the same
+ * terminal handoff the /update path uses, minus the installation step.
+ * The resume contract is dual-written (env + resume.txt) before this runs.
+ */
+function runRestart(ctx: Context, profile: string | undefined, sessionId: string): void {
+  logRestartEvent('runRestart: entered, disposing cordis root')
+  disposeRootAndThen(ctx, () => {
+    logRestartEvent('runRestart: root disposed, starting restartTui')
+    void restartTui(sessionId).then(
+      restartCode => {
+        logRestartEvent('runRestart: restartTui resolved', { restartCode })
+        if (restartCode !== 0) {
+          writeHandoffNotice(
+            `\ndsh-tui restart failed to spawn (exit ${restartCode}). Your session is preserved — resume with:\n` +
+              `${resumeCommand(profile, sessionId)}\n\n`,
+          )
+        }
+        process.exit(restartCode)
+      },
+      restartError => {
+        const message = restartError instanceof Error ? restartError.message : String(restartError)
+        logRestartEvent('runRestart: restartTui rejected', { message })
+        writeHandoffNotice(
+          `\ndsh-tui restart failed: ${message}. Your session is preserved — resume with:\n` +
+            `${resumeCommand(profile, sessionId)}\n\n`,
+        )
+        process.exit(1)
+      },
+    )
+  })
+}
+
 function runUpdate(
   ctx: Context,
   profile: string | undefined,
@@ -989,9 +1674,14 @@ function resumeCommand(profile: string | undefined, sessionId: string): string {
  * reporting failure on a clean exit would mislead wrapper scripts.
  */
 function disposeRootAndThen(ctx: Context, done: () => void, fallbackCode = 1): void {
-  const timer = setTimeout(() => process.exit(fallbackCode), 5000)
+  const timer = setTimeout(() => {
+    // Diagnosis for a stalled disposal: without this line the fallback exit
+    // is indistinguishable from a successful handoff in the field.
+    logRestartEvent('dispose: timeout, taking fallback exit', { fallbackCode })
+    process.exit(fallbackCode)
+  }, 5000)
   timer.unref()
-  void ctx.root.fiber.dispose().then(
+  void withHostRootCapability(() => ctx.root.fiber.dispose()).then(
     () => {
       clearTimeout(timer)
       done()

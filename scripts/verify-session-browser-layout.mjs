@@ -79,7 +79,7 @@ function makeChannel() {
       { role: 'assistant', text: 'A reply long enough to need wrapping inside the preview pane at every width this sweep visits.', at: 2 },
     ],
     notify() {},
-    resumeTo: async () => true,
+    resumeTo: async () => ({ ok: true }),
     deleteSession: async () => true,
     renameSessionTo: async () => true,
   }
@@ -179,6 +179,12 @@ for (const lang of ['zh', 'en']) {
       )
     }
 
+    // Fixed sleeps kept on purpose (settle would not help here): every
+    // assertion is a layout INVARIANT — no wrapped line, hint row last —
+    // that already holds on the pre-keystroke screen, so polling for it
+    // returns immediately on the stale frame and the new frame goes
+    // untested. The window gives each repaint (and the async session list)
+    // time to land before the invariant is re-checked.
     inspect('initial')
     for (const [keys, label] of KEYS) {
       stdin.write(keys)
